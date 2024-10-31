@@ -3,77 +3,25 @@ from bs4 import BeautifulSoup, Tag
 from typing import Dict, List, Tuple
 from collections import defaultdict
 from loguru import logger
+from lxml import etree
+from collections import deque
 
 logger.add("file_{time}.log")
 
 
-# ----------------------- clean page ---------------
-# (REMOVE <SCRIPT> to </script> and variations)
-SCRIPT_PATTERN = r'<[ ]*script.*?\/[ ]*script[ ]*>'  # mach any char zero or more times
-# text = re.sub(pattern, '', text, flags=(re.IGNORECASE | re.MULTILINE | re.DOTALL))
-
-# (REMOVE HTML <STYLE> to </style> and variations)
-STYLE_PATTERN = r'<[ ]*style.*?\/[ ]*style[ ]*>'  # mach any char zero or more times
-# text = re.sub(pattern, '', text, flags=(re.IGNORECASE | re.MULTILINE | re.DOTALL))
-
-# (REMOVE HTML <META> to </meta> and variations)
-META_PATTERN = r'<[ ]*meta.*?>'  # mach any char zero or more times
-# text = re.sub(pattern, '', text, flags=(re.IGNORECASE | re.MULTILINE | re.DOTALL))
-
-# (REMOVE HTML COMMENTS <!-- to --> and variations)
-COMMENT_PATTERN = r'<[ ]*!--.*?--[ ]*>'  # mach any char zero or more times
-# text = re.sub(pattern, '', text, flags=(re.IGNORECASE | re.MULTILINE | re.DOTALL))
-
-# (REMOVE HTML LINK <LINK> to </link> and variations)
-LINK_PATTERN = r'<[ ]*link.*?>'  # mach any char zero or more times
-
-# (REPLACE base64 images)
-BASE64_IMG_PATTERN = r'<img[^>]+src="data:image/[^;]+;base64,[^"]+"[^>]*>'
-
-# (REPLACE <svg> to </svg> and variations)
-SVG_PATTERN = r'(<svg[^>]*>)(.*?)(<\/svg>)'
-
-
-def replace_svg(html: str, new_content: str = "this is a placeholder") -> str:
-    return re.sub(
-        SVG_PATTERN,
-        lambda match: f"{match.group(1)}{new_content}{match.group(3)}",
-        html,
-        flags=re.DOTALL,
-    )
-
-
-def replace_base64_images(html: str, new_image_src: str = "#") -> str:
-    return re.sub(BASE64_IMG_PATTERN, f'<img src="{new_image_src}"/>', html)
-
-
-def has_base64_images(text: str) -> bool:
-    base64_content_pattern = r'data:image/[^;]+;base64,[^"]+'
-    return bool(re.search(base64_content_pattern, text, flags=re.DOTALL))
-
-
-def has_svg_components(text: str) -> bool:
-    return bool(re.search(SVG_PATTERN, text, flags=re.DOTALL))
-
-
-def clean_html(html: str, clean_svg: bool = False, clean_base64: bool = False):
-    html = re.sub(SCRIPT_PATTERN, '', html, flags=(re.IGNORECASE | re.MULTILINE | re.DOTALL))
-    html = re.sub(STYLE_PATTERN, '', html, flags=(re.IGNORECASE | re.MULTILINE | re.DOTALL))
-    html = re.sub(META_PATTERN, '', html, flags=(re.IGNORECASE | re.MULTILINE | re.DOTALL))
-    html = re.sub(COMMENT_PATTERN, '', html, flags=(re.IGNORECASE | re.MULTILINE | re.DOTALL))
-    html = re.sub(LINK_PATTERN, '', html, flags=(re.IGNORECASE | re.MULTILINE | re.DOTALL))
-
-    if clean_svg:
-        html = replace_svg(html)
-
-    if clean_base64:
-        html = replace_base64_images(html)
-
-    return html
-
-
 class XPathHTMLAnalyzer:
     """分析HTML中body下两层深度的元素结构，生成XPath，分析链接和文本比例，以及检测视频播放器"""
+    # HTML清理相关的正则表达式模式
+    PATTERNS = {
+        'script': r'<[ ]*script.*?\/[ ]*script[ ]*>',  # 移除脚本标签
+        'style': r'<[ ]*style.*?\/[ ]*style[ ]*>',    # 移除样式标签
+        'meta': r'<[ ]*meta.*?>',                      # 移除meta标签
+        'comment': r'<[ ]*!--.*?--[ ]*>',             # 移除HTML注释
+        'link': r'<[ ]*link.*?>',                     # 移除link标签
+        'base64_img': r'<img[^>]+src="data:image/[^;]+;base64,[^"]+"[^>]*>',  # 替换base64图片
+        'svg': r'(<svg[^>]*>)(.*?)(<\/svg>)',         # 替换SVG内容
+        'base64_content': r'data:image/[^;]+;base64,[^"]+'  # 检测base64内容
+    }
     
     def __init__(self):
         self.semantic_tags = {
@@ -83,7 +31,9 @@ class XPathHTMLAnalyzer:
             'article': '文章',
             'section': '区块',
             'aside': '侧边栏',
-            'footer': '页脚'
+            'footer': '页脚',
+            'logo': '头部',
+            'top': '头部'
         }
         
         # 视频播放器特征
@@ -119,34 +69,69 @@ class XPathHTMLAnalyzer:
                 r'player\.bilibili\.com'
             ]
         }
+        # 添加可见性检查的配置
+        self.invisible_tags = {'script', 'style', 'link', 'meta'}
+        self.invisible_classes = {'hide', 'hidden'}
+
+    def is_visible(self, tag: Tag) -> bool:
+        """统一的可见性检查方法"""
+        if not isinstance(tag, Tag):
+            return False
+            
+        if tag.name in self.invisible_tags:
+            return False
+            
+        style = tag.get('style', '').lower()
+        if 'display:none' in style or 'visibility:hidden' in style:
+            return False
+            
+        classes = {cls.lower() for cls in tag.get('class', [])}
+        if classes & self.invisible_classes:  # 使用集合交集判断
+            return False
+            
+        return True
 
     def get_xpath_x(self, element: Tag) -> str:
-        """获取元素的XPath路径"""
-        components = []
-        child = element
-        
-        while child and child.parent:
-            # 获取当前元素在同类型兄弟节点中的位置
-            siblings = child.parent.find_all(child.name, recursive=False)
-            if len(siblings) > 1:
-                # 处理可能的非闭合标签，使用更可靠的方式计算位置
-                position = 0
-                for sibling in siblings:
-                    if sibling is child:
-                        break
-                    position += 1
-                components.append(f'{child.name}[{position + 1}]')
-            else:
-                components.append(child.name)
+        """获取body下元素的XPath路径"""
+        if not element or not element.parent:
+            return ""
             
-            child = child.parent
-            # 如果父元素是[document]，停止遍历
-            if isinstance(child, BeautifulSoup):
-                break
+        # 跳过 html 标签和其他不合理的标签
+        if element.name in ['html', 'head', 'body']:
+            return ""
+            
+        components = []
+        current = element
         
-        # 反转路径并组合
-        xpath = '//' + '/'.join(reversed(components))
-        return xpath
+        # 从当前元素向上遍历，直到body
+        while current and current.parent:
+            if current.parent.name == 'body':
+                # 获取在body下的位置
+                previous_siblings = current.find_previous_siblings(current.name)
+                position = len(list(previous_siblings))
+                if position > 0:
+                    components.append(f"{current.name}[{position + 1}]")
+                else:
+                    components.append(current.name)
+                break
+            elif current.parent.name not in ['html', 'head']:
+                # 获取在父元素下的位置
+                previous_siblings = current.find_previous_siblings(current.name)
+                position = len(list(previous_siblings))
+                if position > 0:
+                    components.append(f"{current.name}[{position + 1}]")
+                else:
+                    components.append(current.name)
+            
+            current = current.parent
+        
+        # 如果没有找到有效的路径，返回空字符串
+        if not components:
+            return ""
+        
+        # 反转组件列表并组合成XPath
+        components.reverse()
+        return "//body/" + "/".join(components)
 
     def get_xpath(self, element: Tag) -> str:
         """生成元素的XPath路径"""
@@ -200,7 +185,10 @@ class XPathHTMLAnalyzer:
         return video_links
 
     def detect_video_player(self, element: Tag) -> Dict:
-        """检测元素是否是视频播放器"""
+        """简化的视频播放器检测"""
+        if not self.is_visible(element):
+            return {'is_player': False}
+            
         result = {
             'is_player': False,
             'player_type': None,
@@ -208,87 +196,59 @@ class XPathHTMLAnalyzer:
             'details': {}
         }
         
-        # 检查标签名和视频相关属性
-        if element.name in ['video', 'iframe', 'embed', 'object']:
-            result['is_player'] = True
-            result['player_type'] = self.video_player_patterns['tags'].get(element.name, '其他播放器')
+        # 检查标签名
+        if element.name in self.video_player_patterns['tags']:
+            result.update(self._check_video_tag(element))
             
-            # 收集视频源信息
-            src = element.get('src', '')
-            data_src = element.get('data-src', '')
-            source_url = src or data_src
-            
-            if source_url:
-                result['details']['src'] = source_url
-                # 检查是否是已知的视频平台
-                for pattern in self.video_player_patterns['src_patterns']:
-                    if re.search(pattern, source_url):
-                        result['source_type'] = 'embedded'
-                        break
-                if not result['source_type']:
-                    result['source_type'] = 'native'
-                    
-            # 检查video标签的source子元素
-            if element.name == 'video':
-                sources = element.find_all('source')
-                if sources:
-                    result['details']['sources'] = [
-                        {'src': src.get('src', ''), 'type': src.get('type', '')}
-                        for src in sources if src.get('src')
-                    ]
-        
         # 检查类名和ID
-        classes = element.get('class', [])
+        if not result['is_player']:
+            result.update(self._check_video_attributes(element))
+            
+        return result
+
+    def _check_video_tag(self, element: Tag) -> Dict:
+        """检查视频相关标签"""
+        result = {
+            'is_player': True,
+            'player_type': self.video_player_patterns['tags'].get(element.name),
+            'source_type': None,
+            'details': {}
+        }
+        
+        src = element.get('src') or element.get('data-src', '')
+        if src:
+            result['details']['src'] = src
+            result['source_type'] = next(
+                (p for p in self.video_player_patterns['src_patterns'] 
+                 if re.search(p, src)), 'native'
+            )
+            
+        return result
+
+    def _check_video_attributes(self, element: Tag) -> Dict:
+        """检查视频相关属性"""
+        classes = set(element.get('class', []))
         element_id = element.get('id', '').lower()
         
-        video_related_classes = [c for c in classes if any(
-            pattern.lower() in c.lower() for pattern in 
-            self.video_player_patterns['classes'] + ['video', 'player', 'media']
-        )]
-        
-        video_related_id = any(
-            pattern.lower() in element_id for pattern in 
-            self.video_player_patterns['ids'] + ['video', 'player', 'media']
+        video_classes = {c for c in classes 
+                        if any(p.lower() in c.lower() 
+                              for p in self.video_player_patterns['classes'])}
+                              
+        is_video = bool(video_classes) or any(
+            p.lower() in element_id 
+            for p in self.video_player_patterns['ids']
         )
         
-        if video_related_classes or video_related_id:
-            result['is_player'] = True
-            if not result['player_type']:
-                result['player_type'] = '自定义播放器'
-                if video_related_classes:
-                    result['details']['classes'] = video_related_classes
-                if video_related_id:
-                    result['details']['id'] = element_id
-        
-        # 检查data属性
-        data_attrs = {k: v for k, v in element.attrs.items() if k.startswith('data-')}
-        video_related_data = {k: v for k, v in data_attrs.items() if any(
-            term in k.lower() for term in ['video', 'player', 'media']
-        )}
-        
-        if video_related_data:
-            result['is_player'] = True
-            if not result['player_type']:
-                result['player_type'] = "数据属性视频播放器"
-            result['details']['data_attributes'] = video_related_data
-                
-        return result
+        return {
+            'is_player': is_video,
+            'player_type': '自定义播放器' if is_video else None,
+            'details': {'classes': list(video_classes)} if video_classes else {}
+        }
 
     def analyze_text_and_links(self, element: Tag) -> Dict:
         """分析元素内的文本和链接数量及内容"""
         texts = []
         links = []
-        
-        # for text in element.stripped_strings:
-        #     if not any(parent.name == 'a' for parent in element.parents):
-        #         texts.append(text)
-        
-        # for link in element.find_all('a'):
-        #     links.append({
-        #         'text': link.get_text(strip=True),
-        #         'href': link.get('href', ''),
-        #         'xpath': self.get_xpath_x(link)
-        #     })
         
         # 检查元素是否可见
         def is_visible(tag):
@@ -322,20 +282,75 @@ class XPathHTMLAnalyzer:
             
         pure_text = ' '.join(texts)
         
-        text_links = [item['text'] for item in links]
-        text_links = ' '.join(text_links)
+        # text_links = [item['text'] for item in links]
+        # text_links = ' '.join(text_links)
+        # lnks_text_len = 
+        lnks_words_count = sum(len(d['text']) for d in links) 
+        word_counts_without_lnks = len(pure_text) - lnks_words_count  
         
         return {
             'text_content': pure_text,
             'text_length': len(pure_text),
             'link_count': len(links),
             'links': links,
-            'text_to_link_ratio': len(pure_text) / (len(text_links) if len(text_links)>0 else 1)
+            'text_to_link_ratio': len(pure_text) / (lnks_words_count if lnks_words_count >0 else 1),
+            'word_counts_without_lnks': word_counts_without_lnks
         }
+
+    def clean_html(self, html: str, clean_svg: bool = False, clean_base64: bool = False) -> str:
+        """清理HTML内容，移除不需要的标签和内容"""
+        flags = (re.IGNORECASE | re.MULTILINE | re.DOTALL)
+        
+        # 移除不需要的标签
+        for pattern_name in ['script', 'style', 'meta', 'comment', 'link']:
+            html = re.sub(self.PATTERNS[pattern_name], '', html, flags=flags)
+        
+        # 处理SVG
+        if clean_svg:
+            html = self._replace_svg(html)
+        
+        # 处理base64图片
+        if clean_base64:
+            html = self._replace_base64_images(html)
+        
+        return html
+    
+    def _replace_svg(self, html: str, new_content: str = "this is a placeholder") -> str:
+        """替换SVG内容为占位符"""
+        return re.sub(
+            self.PATTERNS['svg'],
+            lambda match: f"{match.group(1)}{new_content}{match.group(3)}",
+            html,
+            flags=re.DOTALL
+        )
+    
+    def _replace_base64_images(self, html: str, new_image_src: str = "#") -> str:
+        """替换base64编码的图片为普通图片链接"""
+        return re.sub(
+            self.PATTERNS['base64_img'], 
+            f'<img src="{new_image_src}"/>', 
+            html
+        )
+    
+    def has_base64_images(self, text: str) -> bool:
+        """检查文本是否包含base64编码的图片"""
+        return bool(re.search(
+            self.PATTERNS['base64_content'], 
+            text, 
+            flags=re.DOTALL
+        ))
+    
+    def has_svg_components(self, text: str) -> bool:
+        """检查文本是否包含SVG组件"""
+        return bool(re.search(
+            self.PATTERNS['svg'], 
+            text, 
+            flags=re.DOTALL
+        ))
 
     def analyze_structure(self, html_content: str) -> Dict:
         """分析HTML结构并返回带XPath的结果，包含文本、链接和视频播放器分析"""
-        html_content = clean_html(html_content)
+        # html_content = self.clean_html(html_content).replace('\n','').replace('\t','')
         soup = BeautifulSoup(html_content, 'html.parser')
         body = soup.find('body')
         
@@ -357,31 +372,9 @@ class XPathHTMLAnalyzer:
     def _analyze_first_level(self, body: Tag) -> List[Dict]:
         """分析第一层元素，包含文本、链接和视频播放器分析"""
         first_level = []
-        
-        def is_visible(tag):
-            if not isinstance(tag, Tag):
-                return False
                 
-            if tag.name in ['script', 'style', 'link', 'meta']:
-                return False
-                
-            style = tag.get('style', '').lower()
-            if 'display:none' in style or 'visibility:hidden' in style:
-                return False
-                
-            classes = tag.get('class', [])
-            if any('hide' in cls.lower() or 'hidden' in cls.lower() for cls in classes):
-                return False
-                
-            return True
-        
         for element in body.children:
-            # if not isinstance(element, Tag):
-            #     continue
-                
-            # if element.name in ['script', 'style', 'link', 'meta']:
-            #     continue
-            if not is_visible(element):
+            if not self.is_visible(element):
                 continue
             
             
@@ -407,41 +400,14 @@ class XPathHTMLAnalyzer:
         """分析第二层元素，包含文本、链接和视频播放器分析"""
         second_level = []
         
-        def is_visible(tag):
-            if not isinstance(tag, Tag):
-                return False
-                
-            if tag.name in ['script', 'style', 'link', 'meta']:
-                return False
-                
-            style = tag.get('style', '').lower()
-            if 'display:none' in style or 'visibility:hidden' in style:
-                return False
-                
-            classes = tag.get('class', [])
-            if any('hide' in cls.lower() or 'hidden' in cls.lower() for cls in classes):
-                return False
-                
-            return True
         
         for parent in body.children:
-            # if not isinstance(parent, Tag):
-            #     continue
-                
-            # if parent.name in ['script', 'style', 'link']:
-            #     continue
-                
-            # for child in parent.children:
-            #     if not isinstance(child, Tag):
-            #         continue
-                    
-            #     if child.name in ['script', 'style', 'link']:
-            #         continue
-            if not is_visible(parent):
+
+            if not self.is_visible(parent):
                 continue
                 
             for child in parent.children:
-                if not is_visible(child):
+                if not self.is_visible(child):
                     continue
                 
                 text_link_analysis = self.analyze_text_and_links(child)
@@ -482,7 +448,7 @@ class XPathHTMLAnalyzer:
         total_text_length = 0
         total_links = 0
         video_players = []
-        
+     
         # 统计第一层
         for elem in first_level:
             total_text_length += elem['text_analysis']['text_length']
@@ -493,6 +459,7 @@ class XPathHTMLAnalyzer:
                     'type': elem['video_player']['player_type'],
                     'source_type': elem['video_player']['source_type']
                 })
+
             
         # 统计第二层
         for elem in second_level:
@@ -552,22 +519,26 @@ def print_analysis(html_content: str) -> None:
             
     
     logger.debug("\n2. 第一层元素:=====================================================")
-    ret = selector.xpath('/html/body')     # 返回为一列表
-    tag_level1 = {'tags_xpath':set(), 'contents_xpath':set()}
+    # ret = selector.xpath('/html/body')     # 返回为一列表
+    tag_level1 = {'tags_xpath':deque(), 'contents_xpath':deque()}
     for i, elem in enumerate(results['first_level'], 1):
-        if elem['role'] in ['主要内容', '文章', '区块', '普通元素'] and elem['text_analysis']['text_length'] > 50:
-            if elem['text_analysis']['link_count'] > 0 and elem['text_analysis']['text_to_link_ratio'] >0.5 and elem['text_analysis']['text_to_link_ratio'] < 2.0:
+        if elem['role'] in ['主要内容', '文章', '区块', '普通元素'] and elem['text_analysis']['text_length'] > 0:
+            if elem['text_analysis']['link_count'] > 0 and elem['text_analysis']['text_to_link_ratio'] >0.5 and elem['text_analysis']['word_counts_without_lnks'] < 10:
                 # 可能是列表元素
-                tag_level1['tags_xpath'].add(elem['xpath'])
+                # tag_level1['tags_xpath'].add(elem['xpath'])
+                if len(elem['xpath'])>1:
+                    tag_level1['tags_xpath'].append(elem['xpath'])
             else:
                 # 可能是正文元素
-                tag_level1['contents_xpath'].add(elem['xpath'])
+                if len(elem['xpath'])>1:
+                    tag_level1['contents_xpath'].append(elem['xpath'])
                 
         logger.debug(f"\n   元素 {i}:")
         logger.debug(f"   - XPath: {elem['xpath']}")
         logger.debug(f"   - 标签: {elem['tag']}")
         logger.debug(f"   - 角色: {elem['role']}")
         logger.debug(f"   - 文本: {elem['text_analysis']['text_content']} ")
+        logger.debug(f"   - 纯文本字数: {elem['text_analysis']['word_counts_without_lnks']} ")
         logger.debug(f"   - 链接数量: {elem['text_analysis']['link_count']} 个")
         logger.debug(f"   - 文本/链接比例: {elem['text_analysis']['text_to_link_ratio']:.2f}")
         # element = html.xpath(elem['xpath'])
@@ -589,43 +560,66 @@ def print_analysis(html_content: str) -> None:
         #         logger.debug(f"     * {link['text']} ({link['href']})")
     
     logger.debug("\n3. 第二层元素:#########################################################")
+    
+    # tag_level1['contents_xpath'].discard('')
+    # tag_level1['tags_xpath'].discard()
+    # tag_level1['contents_xpath'] = list(tag_level1['contents_xpath'])[::-1]
+    
     for i, elem in enumerate(results['second_level'], 1):
-        for l1_path in tag_level1['tags_xpath']:
-            if l1_path in elem['xpath']:
-                if len(elem['text_analysis']['links']) > 0:
-                    for link in elem['text_analysis']['links']:
-                        logger.debug(f"     * {link['text']} ({link['href']})")
+        if elem['role'] not in ['主要内容', '文章', '区块', '普通元素'] or len(elem['xpath'])<1:
+            continue
+        # for l1_path in tag_level1['tags_xpath']:
+        #     if l1_path in elem['xpath']:
+        #         if len(elem['text_analysis']['links']) > 0:
+        #             for link in elem['text_analysis']['links']:
+        #                 logger.debug(f"     * {link['text']} ({link['href']})")
                     
-        for l1_path in tag_level1['contents_xpath']:
-            if l1_path in elem['xpath']:
+        # for l1_path in tag_level1['contents_xpath']:
+        #     if l1_path in elem['xpath']:
+        #         if  elem['text_analysis']['word_counts_without_lnks'] > 10:
+        #             logger.debug(f"\n ☆☆ 内容元素 ☆☆")
+        #             pure_text = elem['text_analysis']['text_content']
+        #             logger.debug(f"   xxxxxxxxxx- XPath: {elem['xpath']}")
+        #             for link in elem['text_analysis']['links']:
+        #                 logger.debug(f"   - XPath: {link['xpath']}")
+        #                 pure_text = pure_text.replace(link['text'], '')
+        #             # final_report['contents'].add(pure_text)
+        #             # logger.debug(f"   - XPath: {elem['xpath']}")
+        #             logger.debug(f"   - 文本: {pure_text} ")
+        index = next((i for i, prefix in enumerate(tag_level1['contents_xpath']) if elem['xpath'].startswith(prefix)), None)
+        
+        if index is None:
+            continue
+
+        if elem['text_analysis']['word_counts_without_lnks'] > 10:
+            logger.debug(f"\n ☆☆ 内容元素 ☆☆")
+            
+            # 使用XPath提取当前元素的所有文本节点，排除<a>标签内的文本
+            try:
+                # 获取当前元素
+                element = selector.xpath(elem['xpath'])[0]
                 
-                if elem['text_analysis']['text_length'] > 20 and elem['text_analysis']['text_to_link_ratio'] > 10:
-                    logger.debug(f"\n ☆☆ 内容元素 ☆☆")
-                    logger.debug(f"   - XPath: {elem['xpath']}")
-                    logger.debug(f"   - 文本: {elem['text_analysis']['text_content']} ")
-                    # logger.debug(f" {elem['text_analysis']['text_length']}")
-                # for link in elem['text_analysis']['links']:
-                #     logger.debug(f"     * {link['text']} ({link['href']})")
-        
-        
-        # logger.debug(f"\n   元素 {i}:")
-        # logger.debug(f"   - 标签: {elem['tag']}")
-        # logger.debug(f"   - 角色: {elem['role']}")
-        # logger.debug(f"   - 文本/链接比例: {elem['text_analysis']['text_to_link_ratio']:.2f}")
-        
-        # logger.debug(ret[0].xpath(elem['xpath']+'/*/text()'))
-        
-        # if elem['video_player']['is_player']:
-        #     logger.debug(f"   - 视频播放器: {elem['video_player']['player_type']}")
-        #     if elem['video_player']['details']:
-        #         logger.debug("     详情:")
-        #         for k, v in elem['video_player']['details'].items():
-        #             logger.debug(f"     * {k}: {v}")
-        
-        # if elem['text_analysis']['links']:
-        #     logger.debug("   - 链接列表:")
-        #     for link in elem['text_analysis']['links']:
-        #         logger.debug(f"     * {link['text']} ({link['href']})")
+                # 获取所有直接文本节点和非链接元素的文本
+                texts = []
+                for text in element.xpath('.//text()[not(parent::a)]'):
+                    text = text.strip()
+                    if text:  # 只保留非空文本
+                        texts.append(text)
+                
+                pure_text = ' '.join(texts)
+                logger.debug(f"   - XPath: {elem['xpath']}")
+                logger.debug(f"   - 文本内容: {pure_text}")
+                
+                # 如果需要，也可以单独列出链接
+                # links = element.xpath('.//a')
+                # for link in links:
+                #     link_text = link.text.strip() if link.text else ''
+                #     link_xpath = elem['xpath'] + link.getroottree().getpath(link)[len(element.getroottree().getpath(element)):]
+                    # logger.debug(f"   - 排除的链接文本: {link_text} (XPath: {link_xpath})")
+                    
+            except Exception as e:
+                logger.error(f"XPath提取失败: {e}")
+                continue
                 
     logger.debug("\n=== L结构分析报告 (结论)===\n")
     # for i, elem in enumerate(results['first_level'], 1):
@@ -636,629 +630,950 @@ def print_analysis(html_content: str) -> None:
 # 使用示例
 if __name__ == "__main__":
     sample_html = """
-<!doctype html>
+<!DOCTYPE html>
 <html>
-<head>
-<meta charset="utf-8">
-<meta name="renderer" content="webkit">
-<title>最高检：1-9月检察机关共起诉组织、领导传销活动罪4627人_河北新闻网</title>
-<link rel="shortcut icon" type="image/ico" href="https://www.hebnews.cn/index.ico" />
-<meta name="viewport" content="width=device-width, initial-scale=1">
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+                <meta http-equiv="pragma" content="no-cache">
+                <meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
+                <meta http-equiv="expires" content="0">
+		<meta name="viewport" content="width=1200">
+<meta name="viewport" content="width=device-width,height=device-height, user-scalable=no,initial-scale=1, minimum-scale=1, maximum-scale=1,target-densitydpi=device-dpi">
+		<meta name="apple-mobile-web-app-capable" content="yes">
+		<meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+                <meta name="keywords" content="">
+		<title>辽宁省2024年高素质农民培育省级重点班开班-东北新闻网</title>
+		<meta name="keywords" content="辽宁东北新闻门户">
+		<meta itemprop="name" content="辽宁东北新闻门户">
+		<link href="/channel-home/nen/css/index.css" rel="stylesheet" type="text/css">
+		<link href="/channel-home/nen/css/content_bd_sz.css?v=1.0.2" rel="stylesheet" type="text/css">
+<link rel="icon" type="image/png" sizes="16x16" href="/channel-home/nen/images/logoico.png"/>
+<link rel="icon" type="image/png" sizes="32x32" href="/channel-home/nen/images/logoico32.png">
+<link rel="icon" type="image/png" sizes="48x48" href="/channel-home/nen/images/logoico48.png">
+<link rel="icon" type="image/png" sizes="96x96" href="/channel-home/nen/images/logoico96.png">
+<link rel="apple-touch-icon-precomposed" sizes="180x180" href="/channel-home/nen/images/logoico180cir.png">
+                <script type="text/javascript" src="/channel-home/nen/js/index20210608.js"></script>
+		<style type="text/css">
+* {
+		box-sizing:border-box;
+	}
+	html {
+	    font-size: calc(100vw / 18.75);
+	}
+	body {
+	  -webkit-text-size-adjust: none;
+	  color: #000;
+	  font: 0.14rem/1.8 "Microsoft Yahei", -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", STHeiti, "Microsoft Yahei", Tahoma, Simsun, sans-serif;
+	}
+html {background:none;}
+   video { width:700px;}
+.list_h_wx {
+			position: relative;
+			width: 100px;
+			line-height: 40px;
+			height: 40px;
+			top: -50px;
+			left: 1100px;
+			z-index: 9;
+			display: flex;
+		}
 
-<meta name="author" content="ypp,zj">
-<meta name="contentid" content="9254045">
-<meta name="publishdate" content="2024-10-28 10:25:36">
-<meta name="author" content="张宇晴">
-<meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
-<meta name="description" content="2024年1月至9月，全国检察机关起诉组织、领导传销活动罪4627人。检察办案发现，近年来，随着依法惩治传销犯罪力度不断加大，一些犯罪分子为躲避监管打击，将传销由线下转移至线上。有的直接将传统传销活动“搬到”网上。截至2023年7月，该平台共吸引会员9万余人，形成多达245层的传销网络。">
-<meta name="keyword" content="检察机关,法制,社会万象,违法犯罪,诈骗">
-<meta property="og:type" content="acticle">
-<meta property="og:title" content="最高检：1-9月检察机关共起诉组织、领导传销活动罪4627人">
-<meta property="og:site_name " content="河北新闻网">
-<meta property="og:url" content="https://world.hebnews.cn/2024-10/28/content_9254045.htm" />
-<meta property="og:image" content="https://img.hebnews.cn/2024-10/28/959d9fcc-7664-42d9-bce8-742e881aca1b.jpg">
-<meta property="og:description" content="2024年1月至9月，全国检察机关起诉组织、领导传销活动罪4627人。检察办案发现，近年来，随着依法惩治传销犯罪力度不断加大，一些犯罪分子为躲避监管打击，将传销由线下转移至线上。有的直接将传统传销活动“搬到”网上。截至2023年7月，该平台共吸引会员9万余人，形成多达245层的传销网络。">
-<link rel="canonical" href="https://world.hebnews.cn/2024-10/28/content_9254045.htm" />
-<link rel="next" title="各地陆续进入最美赏秋季" href="https://world.hebnews.cn/2024-10/28/content_9254034.htm" />
-<!-- 页面匹配手机1:1 需要设置响应式 -->
-<link href="https://img.hebnews.cn/templateRes/201612/15/88932/88932/images/default.css?20230907y" rel="stylesheet" type="text/css" />
-<!--<script type="text/javascript" src='https://apps.hebnews.cn/h5share/common/closewxmenu.js'></script>加载完之前禁止分享-->
-<script type="text/javascript" src='https://img.hebnews.cn/jquery-1.8.3.min.js'></script>
-<script type="text/javascript" src="https://img.hebnews.cn/templateRes/201612/15/88932/88932/images/QRCode.js"></script>
-<!--<script type="text/javascript" src="https://img.hebnews.cn/templateRes/201612/15/88932/88932/images/ResizeSensor.min.js"></script>
-<script type="text/javascript" src="https://img.hebnews.cn/templateRes/201612/15/88932/88932/images/theia-sticky-sidebar.min.js"></script>-->
+		.list_h_wx p {
+			line-height: 30px;
+			float: left;
+		}
 
-<script src="https://res.wx.qq.com/open/js/jweixin-1.6.0.js"></script>
-<script src="https://qzonestyle.gtimg.cn/qzone/qzact/common/share/share.js"></script>
-<script type="text/javascript" src='https://apps.hebnews.cn/h5share/js_jjb/h5Share1.4.0.js?1'></script>
-
-<!-- 统计代码 -->
-<script language="javascript">
-var	_yfx_videoplayerid = "videoplayer";
-var _yfx_nodeid = "138";
-var _yfx_contentid = "9254045";
-var _yfx_title = "最高检：1-9月检察机关共起诉组织、领导传销活动罪4627人";
-var _yfx_editor = "张宇晴";
-var _yfx_pubtime = "2024-10-28 10:25:36";
-var _yfx_website = "10000001";
-(function() {
-    var yfxjs = document.createElement("script");
-    yfxjs.charset = "utf-8";
-    yfxjs.src = "//counter.hebnews.cn/count/yeefxcount.js";
-    var yfxjs_t = document.getElementsByTagName("script")[0];
-    yfxjs_t.parentNode.insertBefore(yfxjs, yfxjs_t);
-})();
-	
-var _yfx_trackdata= _yfx_trackdata || [];
-
-</script>
-<script>
-var _hmt = _hmt || [];
-(function() {
-  var hm = document.createElement("script");
-  hm.src = "https://hm.baidu.com/hm.js?fc19c432c6dd37e78d6593b2756fb674";
-  var s = document.getElementsByTagName("script")[0]; 
-  s.parentNode.insertBefore(hm, s);
-})();
-</script>
-</head>
-
-<body>
-<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
-<style>
-.hp2017_g_width{ width:1400px; margin: 0 auto; overflow:hidden}
-.hp2017_navigation{ height: 52px; background:#f2f2f2;  font-size: 14px; line-height:52px;}
-.hp2017_navigation li{ padding:0 10px; float: left ;overflow: visible; white-space: nowrap;}
-.hp2017_navigation li img{ vertical-align:middle}
-.hp2017_navigation a{ color:#333; text-decoration: none}
-.hp2017_navigation a:hover{text-decoration: underline;}
-li.hp2017_navigation_jia{border:0; float:right; width:50px; height: 50px; text-align: center;padding-bottom:40px; overflow: visible;}
-li.hp2017_navigation_jia:hover .hp2017_navigation_more{ display: block; position: absolute; z-index: 999}
-.hp2017_navigation_more{ display: none ; width: 800px;height:50px; margin-left: -740px; margin-top: 10px;*margin-top:30px;box-shadow: 0px 0 5px #d0d0d0;border:#dbdbdb solid 1px;background:#fff; position:relative}
-.hp2017_navigation_more li{ padding:0 10px 0 13px; border-right: 0}
-.hp2017_navigation_more a{color:#333; position: relative; z-index: 99999 }
-
-</style>
-<div class="hp2017_navigation">
-	<div class="hp2017_g_width">
-		<ul>
-<li ><a target="_blank" href="https://www.hebnews.cn"><img src="https://img.hebnews.cn/templateRes/202105/19/307398/307398/logo.png" width="104" style=""/></a></li>
-<li><a target="_blank" href="https://hebei.hebnews.cn">河北要闻</a></li>
-<li><a target="_blank" href="https://tousu.hebnews.cn">阳光理政</a></li>
-<li><a target="_blank" href="https://zhuanti.hebnews.cn/node_353620.htm">京津冀</a></li>
-<li><a target="_blank" href="https://xiongan.hebnews.cn">雄安新区</a></li>
-<li><a target="_blank" href="https://zhuanti.hebnews.cn/node_353473.htm">后冬奥</a></li>
-<li><a target="_blank" href="https://dahezhibei.hebnews.cn/sy.htm">大河之北</a></li>
-<li><a target="_blank" href="https://comment.hebnews.cn">慷慨歌</a></li>
-<li><a target="_blank" href="https://theory.hebnews.cn">理论</a></li>
-<li><a target="_blank" href="https://gov.hebnews.cn">政务</a></li>
-<li><a target="_blank" href="https://sxbgt.hebnews.cn/">阳光执信</a></li>
-<li><a target="_blank" href="https://hebei.hebnews.cn/node_357312.htm">直播</a></li>
-
-<li><a target="_blank" href="https://xczx.hebnews.cn">乡村振兴</a></li>
-<li><a target="_blank" href="https://shengtaihuanbao.hebnews.cn/">生态环保</a></li>
-<li><a target="_blank" href="https://yxhb.hebnews.cn">影像河北</a></li>
-<li><a target="_blank" href="https://gongyi.hebnews.cn">公益</a></li>
-<li><a target="_blank" href="https://travel.hebnews.cn">文旅</a></li>
-<li><a target="_blank" href="https://yuqing.hebnews.cn">舆情</a></li>
-<li><a target="_blank" href="https://finance.hebnews.cn">财经</a></li>
-<li><a target="_blank" href="https://guoqi.hebnews.cn">国企</a></li>
-
-			<li class="hp2017_navigation_jia"><img src="https://img.hebnews.cn/templateRes/202105/19/307398/307398/jia.png" alt="">
-				<ul class="hp2017_navigation_more">
-<li><a target="_blank" href="https://house.hebnews.cn">房产</a></li>
-<li><a target="_blank" href="https://tc.hebnews.cn">体彩</a></li>
-<li><a target="_blank" href="https://sports.hebnews.cn">体育</a></li>
-<li><a target="_blank" href="https://jingji.hebnews.cn">产经</a></li>
-<li><a target="_blank" href="https://edu.hebnews.cn">教育</a></li>
-<li><a target="_blank" href="https://health.hebnews.cn">健康</a></li>
-<li><a target="_blank" href="https://power.hebnews.cn">电力</a></li>
-<li><a target="_blank" href="https://jt.hebnews.cn">交通</a></li>
-<li><a target="_blank" href="https://zhuanti.hebnews.cn">专题</a></li>
-<li><a target="_blank" href="https://zhongyiyao.hebnews.cn">中医中药</a></li>
-<li><a target="_blank" href="https://shangmao.hebnews.cn/">商贸</a></li>
-<li><a target="_blank" href="https://shuhua.hebnews.cn/">书画</a></li>
-<li><a target="_blank" href="https://auto.hebnews.cn/">汽车</a></li>
-<li><a target="_blank" href="https://digi.hebnews.cn/">数码</a></li>
-<li><a target="_blank" href="https://design.hebnews.cn">视觉</a></li>
-					<span class="hp2017_navigation_more_bg"></span>
-				</ul>
-			</li>
-		</ul>
-
-	</div>
-</div>
-<!-- 专题分享代码，不要更换id名称 -->
-<div id="content" style="display:none">
-<!-- 专题缩略图 -->
-<!--<img src="https://img.hebnews.cn/templateRes/201612/15/88932/88932/20230327_4.png" alt="">-->
-
-<img src="https://img.hebnews.cn/2024-10/28/959d9fcc-7664-42d9-bce8-742e881aca1b.jpg">
-
-<!-- 专题标题 -->
-<p id="shareTitle">最高检：1-9月检察机关共起诉组织、领导传销活动罪4627人</p>
-<!-- 专题摘要 -->
-<!--<p id="shareDesc">最高检：1-9月检察机关共起诉组织、领导传销活动罪4627人</p>-->
-<p id="shareDesc">来自河北新闻网</p>
-</div>
-<div class="bc_nav">
-    	<div class="bc_main"><div class="n_logo"><a href="http://www.hebnews.cn" target="_blank"><img src="https://img.hebnews.cn/templateRes/201702/14/92410/92410/images/logo.png" alt="河北新闻网" title="河北新闻网"></a></div>
-        <a href="https://world.hebnews.cn/index.htm" target="_blank" class="" >国内国际</a><a href="https://world.hebnews.cn/node_138.htm" target="_blank" class="" >国内</a></div>
-    	<div class="bc_search">
-<!--
-            <form onsubmit="per_submit();" method="post" name="form1" target="_blank" action="https://search.hebnews.cn/servlet/SearchServlet.do">
-            <input name="op" value="single" type="hidden">
-            <input name="sort" value="date" type="hidden">
-            <input name="siteID" type="hidden">
-            <input class="bc_search_text" name="contentKey" id="contentKey" value="请输入关键字" onfocus="if(this.value=='请输入关键字')this.value='';" onblur="if(this.value=='')this.value='请输入关键字';">
-            <input class="bc_search_buttom" name="submit" value="搜索" type="submit">
-            </form>
--->
-			
+		.list_h_wx img {
+			height: 35px;
+			float: left;
+			margin-top: 5px;
+		}
 		
-			<input class="bc_search_text" name="contentKey" id="contentKey" value="请输入关键字" onfocus="if(this.value=='请输入关键字')this.value='';" onblur="if(this.value=='')this.value='请输入关键字';">
-            <input class="bc_search_buttom" name="submit" value="搜索" type="submit" onclick="_yfx_trackdata.push(['event', '文章页搜索', '搜索按钮']);">
-			
-		<script>
-
-		(function(){
-    $(".bc_search_buttom").on("click",function(){
-        var keyWord = $(".bc_search_text").val();
-        var url = 'https://hebnewssearch.wes2.com/?pageNow=1&pageSize=10&keyWord='+ keyWord 
-        window.open(url);
-
-    })
-})()
-		</script>
-			
-        </div>
-    </div>
-<div class="y_width">
-	
-    <div class="content">
-        <h1>最高检：1-9月检察机关共起诉组织、领导传销活动罪4627人</h1>
-        <div class="min_cont"><div class="post_source">
-		2024-10-28 10:25:36　来源：人民日报客户端
-    </div>
-        <div class="post_wz">
-        <input id="Btn2" type="button" value="A-" name=""/>
-        <input id="Btn1" type="button" value="A+" name=""/>
-    <script>
-        window.onload= function(){
-            var oPtxt=document.getElementById("p1");
-            var oBtn1=document.getElementById("Btn1");
-            var oBtn2=document.getElementById("Btn2");
-            var num = 20; /*定义一个初始变量*/
-            oBtn1.onclick = function(){
-                num++;
-                oPtxt.style.fontSize=num+'px';
-            };
-            oBtn2.onclick = function(){
-                num--;
-                oPtxt.style.fontSize=num+'px';
-            }
-        }
-    </script>
-        </div>
-        </div>
-    </div>
-</div>
-
-<div class="y_width sidefixedline">
-    <div class="min_left">
-    	<div class="min_left_share">
-            <div class="share_box">
-                <div id="ops_share"></div>
-                <script src="https://img.hebnews.cn/templateRes/201612/15/88932/88932/images/share.min.js" charset="utf-8"></script>
-            </div>
-            <div class="min_qrcode"><div id="qrcode"></div><p>扫码阅读手机版</p></div>
-<script type="text/javascript">
-new QRCode(document.getElementById("qrcode"), "https://world.hebnews.cn/2024-10/28/content_9254045.htm");  // 设置要生成二维码的链接
-</script>
-        </div>
-        <div class="min_con_text" id="p1">
-
-<!--enpcontent--><p style="text-align: left;">2024年1月至9月，全国检察机关起诉组织、领导传销活动罪4627人。检察办案发现，近年来，随着依法惩治传销犯罪力度不断加大，<strong>一些犯罪分子为躲避监管打击，将传销由线下转移至线上。相较于传统传销，网络传销不受时空限制，传播更灵活、活动更隐蔽、资金转移更方便，更易给群众造成重大财产损失，需综合施策、深化治理。</strong></p><p style="text-align: left;"><strong>一、编造各种“骗局”引诱群众参加。</strong>不法分子利用互联网的虚拟性和便捷性，编造花样众多、真假难辨的“致富骗局”，引诱群众参与其中。有的直接将传统传销活动“搬到”网上。如刘某某等人组织、领导传销活动案。刘某某等人注册成立生物科技公司，开设专门网站，组织团队线上线下推广“兴中天互助平台”，以“投资返利”“拉人返利”的形式发展会员，5个月内吸收会员59级、42万余人，涉及全国31个省份和港澳台地区等。有的蹭虚拟货币、区块链、金融创新、慈善互助等新的概念和社会热点开展网络传销。如盛某某等人组织、领导传销活动案。盛某某等人虚构谷歌公司“谷歌币”区块链项目，通过网络媒体公开宣传炒作，对外发布认筹购买“谷歌币”，以ETH（以太币）作为结算币种，共发展会员6万余人，非法获利2000余万元。一些地方还出现了诸如“抢购转售”“网络拍卖”“传播国学”等网络传销新名目，需高度警惕。</p><p style="text-align: left;"><strong>二、打着官方旗号骗取群众信任。</strong>为打消群众疑虑，更好推销所谓“项目”，吸引更多人参加，有的不法分子甚至直接打着“国家项目”“政府支持”等旗号，谎称项目有“国家”“政府”“央企”等背景，并以此开展网络传销活动。如汪某等人组织、领导传销活动案。汪某假冒国家乡村振兴局副主任身份，伙同他人以其实际控制的“掌心集团”的名义，宣称与地方政府合作，通过在多地召开项目发布会、邀请影视明星站台等方式，推广“销销乐”网络平台。截至2023年7月，该平台共吸引会员9万余人，形成多达245层的传销网络。</p><p style="text-align: left;"><strong>三、扩充传销层级规避责任追究。</strong>为尽可能多地骗取群众钱款并规避法律责任，不法分子利用网络便利扩充传销层级，试图以此让自己隐身幕后，并让资金来源和流向难以追踪。如章某某等人组织、领导传销活动案。章某某等人开发“拼拼有礼”APP，以“拼团购物”为噱头，宣称拼团失败的会员可获得返现，吸引群众加入会员并在该APP平台充值下单拼团，并制定不同等级的晋升条件和奖励制度，4个月内即吸引379万余人注册会员，形成多达178个层级的传销网络。</p><p style="text-align: left;">面对花样翻新的“致富秘籍”“投资捷径”等网络宣传，检察机关提醒广大群众要提高警惕，不信“大饼”、不贪“小利”，自觉抵制看似唾手可得的“高额回报”诱惑，避免误入网络传销“陷阱”。</p><p style="text-align: left;"><br/></p><p><span id="cnki_grabber" data-id="1730082259000" style="visibility: hidden;"></span></p><!--/enpcontent--><!--enpproperty <articleid>9254045</articleid><date>2024-10-28 10:25:36:0</date><author>张宇晴</author><title>最高检：1-9月检察机关共起诉组织、领导传销活动罪4627人</title><keyword>检察机关,法制,社会万象,违法犯罪,诈骗</keyword><subtitle></subtitle><introtitle></introtitle><siteid>2</siteid><nodeid>138</nodeid><nodename>国内</nodename><nodesearchname>国内</nodesearchname><picurl>https://img.hebnews.cn/2024-10/28/959d9fcc-7664-42d9-bce8-742e881aca1b.jpg</picurl><url>https://world.hebnews.cn/2024-10/28/content_9254045.htm</url><urlpad>https://m.hebnews.cn/world/2024-10/28/content_9254045.htm</urlpad><sourcename>人民日报客户端</sourcename><abstract>2024年1月至9月，全国检察机关起诉组织、领导传销活动罪4627人。检察办案发现，近年来，随着依法惩治传销犯罪力度不断加大，一些犯罪分子为躲避监管打击，将传销由线下转移至线上。有的直接将传统传销活动“搬到”网上。截至2023年7月，该平台共吸引会员9万余人，形成多达245层的传销网络。</abstract><channel>1</channel>/enpproperty-->
-        </div>
-        <div class="editor">责任编辑：张宇晴</div>
-        <div class="next-page"> 下一篇：<a href="https://world.hebnews.cn/2024-10/28/content_9254034.htm" target="_blank">各地陆续进入最美赏秋季</a> </div>
-<!--
-        <div class="relnews">
-		<h3>相关新闻：</h3>
-		<ul>
-			
-		</ul>
-		</div>
--->
-    
-    </div>
-    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
-<style>
-
-@media screen and (max-width: 640px) {
-.min_right{ width:100%; float: none;}
-	
+		.ct {
+                        width:100%;
+			position: relative;
+                        background:#ffffff;
+		}
+		
+#qrcode {
+             width: 120px;
+    height: 120px;
+    position: absolute;
+    right: -132px;
+    top: -70px;
 }
-
-.min_right{ width:335px; float:right; padding-top:20px}
-
-.ce{background: #fafafa;padding: 16px 13px 10px 12px; margin-bottom:15px}
-.side_title{height: 22px;line-height: 22px;font-size: 18px; border-left:5px #e61d27 solid;padding: 0 15px;position: relative; margin-bottom:16px}
-.side_title a{ color:#010101}
-.side_img img{ width:100%; height:auto}
-ul.f32d16 li{ line-height:32px; border-bottom:1px #ddd dotted}
-ul.f32d16 li:nth-child(2){ border:none}
-ul.f32d16 a{ display:block; line-height: 42px;height: 42px;overflow: hidden;font-size: 16px;white-space: nowrap;text-overflow: ellipsis; color:#000; font-weight:bold}
-ul.f32d16 span{ color:#8d8f8c}
-
-.min_pix{ width:45%; height:auto; float:left; margin:0 3% 15px 2%}
-.min_pix img{ width:100%; height:80px; max-height:100px}
-.min_pix span{ line-height:24px; font-size:14px; color:#646464;text-overflow: -o-ellipsis-lastline;overflow: hidden;text-overflow: ellipsis;display: -webkit-box;-webkit-line-clamp: 2;line-clamp: 2;
--webkit-box-orient: vertical; height:48px }
-.min_pix span a{ color:#646464}
-
-ul.f62d16{ background:url(https://img.hebnews.cn/templateRes/201612/15/88931/88931/xi.png) repeat-y 4px 15px}
-ul.f62d16 li{display: flex;align-items: center; height:62px; line-height:24px; font-size:16px; padding-left:20px; background:url(https://img.hebnews.cn/templateRes/201612/15/88931/88931/to.png) no-repeat left center}
-ul.f62d16 li a{ color:#000}
-
-.side_dubao {text-align: center;padding-bottom: 12px;}
-.side_dubao img{width: 260px;height: 400px;}
-
-.min_sider_pic{ position:relative; width:310px; height:175px;}
-.min_sider_pic img{ width:310px; height:175px;}
-.min_sider_hover{ width:100%; height:40px; position:absolute; left:0; bottom:0; opacity:0.5; filter:alpha(opacity=50); background:#000;}
-.min_sider_text{width:calc(100% - 20px); height:40px; position:absolute; left:0; bottom:0; line-height:40px; text-align:center; font-size:16px; padding:0 10px;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;word-break: break-all; color:#fff}
-.min_sider_text a{ color:#fff}
-
-ul.f50d14 li{ line-height:50px; font-size:14px;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;word-break: break-all; color:#020202; border-bottom:1px #e1e1e1 solid}
-ul.f50d14 li:last-child{ border:none}
-ul.f50d14 li a{color:#020202}
-ul.f50d14 cite{ float:none;}
-
-
-</style>
-
-
-
-
-
-
-
-
-
-<div class="min_right">
-	<div class="min_pic yuqing" style="margin-bottom:10px"><img src="https://img.hebnews.cn/templateRes/202105/24/307406/307406/240120zonglan.jpg" /></div>
-    <!--<div class="min_pic yuqing" style="margin-bottom:10px"><img src="https://img.hebnews.cn/templateRes/202105/24/307406/307406/yzdsb3.jpg" /></div>-->
-	<div class="min_pic yuqing" style="margin-bottom:10px"><a href="https://shop134167982.youzan.com/v2/showcase/homepage?alias=80eaIFt1zd" rel="nofollow" target="_blank"><img src="https://img.hebnews.cn/templateRes/202105/24/307406/307406/zlyp.jpg" /></a></div>
-    	<div class="min_pic ce" style="display:none">
-        	<div class="side_title"><span><a href="https://hebei.hebnews.cn/node_357312.htm" target="_blank">纵览直播</a></span></div>
-            <div class="side_img"><a href="https://live.hebnews.cn/livestream/websocket/getlivestream?liveid=24780"  target="_blank"><img src="https://img.hebnews.cn/2024-04/09/5631fdae-e687-48e0-a7c2-f777870df3a4.png"></a></div>
-            <ul class="f32d16">
-            	
-                <li><a href="http://live.hebnews.cn/livestream/websocket/getlivestream?liveid=24779"  target="_blank">回放｜"河北省扎实推进医疗卫生事业高质量发展"新闻发布会</a><span>2024-04-08 10:02:38</span></li><li><a href="https://live.hebnews.cn/livestream/websocket/getlivestream?liveid=24777"  target="_blank">直播结束丨杏花映长城·杏韵金山岭——金山岭长城第十二届杏花节</a><span>2024-04-05 09:15:40</span></li>
-            </ul>
-        </div>
-        <div class="min_pic ce">
-        	<div class="side_title"><span><a href="https://hebei.hebnews.cn/node_116.htm" target="_blank">热点推荐</a></span></div>
-            
-<div class="min_sider_pic"><a href="https://hebei.hebnews.cn/2024-10/28/content_9254102.htm"><img src="https://img.hebnews.cn/2024-10/28/85e36b8c-7f4f-41c7-8a58-69f80912d27b.jpg" /></a><div class="min_sider_hover"></div><div class="min_sider_text"><a href="https://hebei.hebnews.cn/2024-10/28/content_9254102.htm">百姓看日报｜竞技？也是经济！</a></div></div><!--焦点图第一张图片稿-->
-
-            <ul class="f50d14">
-            	
-<li><a href="https://hebei.hebnews.cn/2024-10/28/content_9253932.htm"><cite style="color:#dd0000">数博会现场直击</cite>｜享受数字里的美好“食”光</a></li><li><a href="https://hebei.hebnews.cn/2024-10/28/content_9253933.htm"><cite style="color:#dd0000">我的手机存照</cite>｜我用创业修补人生“缺憾”</a></li><li><a href="https://hebei.hebnews.cn/2024-10/28/content_9253927.htm"><cite style="color:#dd0000">记者走基层</cite>｜供热管理有了“智慧大脑”</a></li><li><a href="https://hebei.hebnews.cn/2024-10/28/content_9253926.htm"><cite style="color:#dd0000">记者走基层</cite>｜政务服务大厅“搬到”居民家门口</a></li><li><a href="https://hebei.hebnews.cn/2024-10/28/content_9253928.htm"><cite style="color:#dd0000">一线追“新”记</cite>｜食用菌“微型农场”迎新变</a></li><li><a href="https://hebei.hebnews.cn/2024-10/28/content_9253929.htm"><cite style="color:#dd0000">文化快评</cite>｜低级别文物也需要用心呵护</a></li><!--独家-->
-
-            	
-            </ul>
-        </div>
-            <div class="min_pic ce sidefixed">
-                <div class="side_title"><span><a >电子报</a></span><select name="selectsz3 " style=" position: absolute;top: 0; right:10px; border-radius:10px; height:24px; padding-left:10px" onchange="if(this.selectedIndex!=0) window.open(this.options[this.selectedIndex].value,'_blank')">
-    <option selected="selected">河北日报报系</option>
-    <option value="http://hbrb.hebnews.cn/?">河北日报</option>
-    <option value="http://yzdsb.hebnews.cn/">燕赵都市报</option>
-    <option value="http://szbz.hbfzb.com/">河北法制报</option>
-    <option value="http://hbnw.hebnews.cn/index.htm">河北农民报</option>
-    <option value="http://jk.hebnews.cn">医院管理论坛报</option>
-    <option value="http://zhuanti.hebnews.cn/node_138104.htm">河北旅游杂志</option>
-    <option value="http://caixiebian.hebnews.cn/">采写编</option>
-    <option value="http://zw.hebnews.cn/index.htm">杂文月刊</option>
-    </select></div>
-                <div class="side_dubao"><a href="https://hbrb.hebnews.cn?" target="_blank"><img src="https://img.hebnews.cn/2021-04/30/e5ec7212-e824-4bae-be4a-fd41217ea27b.png"    border="0"> </a></div>
-            </div>
-            
-            
-            
-            <div class="min_pic yuqing" style="margin-bottom:10px"><a href="https://yuqing.hebnews.cn/node_356524.htm" target="_blank"><img src="https://img.hebnews.cn/templateRes/202105/24/307406/307406/20210528.jpg" /></a></div>
-            
-			
-        </div>
-
-
-    <div class="cl"></div>
-</div>
-<div class="y_width" style=" margin-top:50px">
-    <div class="qrcode">
-        <p>凡注有“河北新闻网”电头或标明“来源：河北新闻网”的所有作品，版权均为本网站与河北日报报业集团所有（本网为河北日报报业集团独家授权版权管理机构）。未经许可不得转载、摘编、复制、链接、镜像或以其它方式使用上述作品，违者将依法追究法律责任。</p>
-    </div>
-</div>
-<div class="desktop-side-tool CCC-float-bar-right">
-	<!--<div class="min_ewm"><img src="https://img.hebnews.cn/templateRes/201612/15/88932/88932/images/ewm.jpg"><p>关注河北新闻网</p></div>-->
-    <a class="min_top" onClick="window.scrollTo(0,1); window.location.hash=''; return false;" id="CCCFBRScrollToTop" href="javascript:void(0);"></a>
-</div>
-
-<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
-
-<style>
-
-.am-weixin {
-    text-align: center;
-    clear: both;
+.list_h h4 {
     width: 100%;
+    line-height: 36px;
+    float: left;
+    text-align: center;
+    margin: 0px !important;
+    border-bottom: 1px solid #0052B2;
+    padding-bottom:5px;}
+
+.list_h {
+    width: 100%;
+        border-bottom: 0px solid #0052B2;
+}	
+
+
+
+.bg_topbg {
+    width: 100%;
+    height: 65px;
+    background: url(http://ln.nen.com.cn/channel-home/nen/images/bg_bg.jpg) left top repeat-x;
     overflow: hidden;
-    padding-top: 25px;
-    font-size: 1.2em;
-	margin-bottom:2em; display:none
 }
-.am-weixin a{ color:#000}
-
-.am-avg-sm-4>li {
-    width: 25%; float:left; text-align:center
+ .redbg {
+   
+  margin:0px auto !important;
+    font-size:0px;
+   
+}  
+.list {
+    width: 100%;
+    padding-top: 80px;
+    padding-bottom: 20px;
 }
-.am-thumbnail {
-    display: inline-block;
-    padding: 2px;
-    border: 1px solid #ddd;
-    border-radius: 0;
-    background-color: #fff;
-    -webkit-transition: all .2s ease-in-out;
-    transition: all .2s ease-in-out;
+.list ul li {
+    width: 100%;
+    position: relative;
+    overflow: hidden;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    padding-left:20px;
+    border-bottom: 1px solid #eeeeee;
 }
-.nb{ display:none}
-@media screen and (max-width: 640px) {
-	.am-weixin { display:block}
-
+.list ul li::before {
+    content: "";
+    width: 5px;
+    height: 5px;
+    background: #050505;
+    border-radius: 50%;
+    position: absolute;
+    left: 0;
+    top: 14px;
+    -webkit-transform: translateY(-50%);
+    -moz-transform: translateY(-50%);
+    -ms-transform: translateY(-50%);
+    -o-transform: translateY(-50%);
+    transform: translateY(-50%);
 }
-</style>
-<ul class="am-avg-sm-4 am-thumbnails am-weixin">
-<li><img class="am-thumbnail am-thumbnail-weixin" src="https://img.hebnews.cn/92410.files/assets/images/weixin_hbrb.jpg"><p>河北日报<br>微信公众号</p></li>
-<li><img class="am-thumbnail am-thumbnail-weixin" src="https://img.hebnews.cn/templateRes/201612/13/88730/88730/hebnews.jpg"><p>河北新闻网<br>微信公众号</p></li>
-<li><img class="am-thumbnail am-thumbnail-weixin" src="https://img.hebnews.cn/templateRes/201612/13/88730/88730/zonglan.jpg"><p>纵览新闻<br>微信公众号</p></li>
-<li><a href="https://zhuanti.hebnews.cn/hbrbapk.htm?m-page"><img class="am-thumbnail am-thumbnail-weixin" src="https://img.hebnews.cn/templateRes/202104/28/307358/307358/images/2022qr2.jpg"><p>河北日报<br>客户端</p></a></li>
-</ul>
+.list ul li a {
+    max-width: 680px;
+    letter-spacing: 2px;
+    font-size: 16px;
+    font-weight: 500;
+    margin-bottom: 0;
+    color:#050505;
+    display: block;
+    float: left;
+}
+.list ul li span {
+    font-size: 16px;
+    color: #888;
+    line-height: 36px;
+    display: block;
+    float: right;
+    width:200px;
+}
+.list h4 {
+    color: #0052b2;
+    font-size: 24px;
+    border-bottom: 4px solid #d5d5d5;
+    padding-left: 5px;
+    padding-bottom: 10px;
+}
+.list h4 span {
+    border-left: solid 2px #5252b2;
+    padding-left: 15px;
+}
+ @media (min-device-width:320px) and (max-width:1023px), (max-device-width:480px)
+ {
 
-
-<style>
-.h2017_g_width{ width:1200px; margin: 0 auto}
-.h2017_footer{ height: 215px; border-top: 1px #e1e1e1 solid; clear:both; padding-top:20px; overflow:hidden; margin:0 auto; width:1200px}
-.h2017_footer_in{ text-align: center;color:#6c6c6c; font-size: 14px; }
-.h2017_footer_in a{color:#6c6c6c; text-decoration:none}
-.h2017_footer_in p{  padding-bottom: 10px}
-.h2017_footer_in span{ padding:0 6px; }
-.padding-fix span{ padding:0 10px; }
-
-
-.h2017_about{ height: 40px;  font-size: 16px; text-align:center; overflow:hidden}
-.h2017_about ul{ display: block;margin:0 auto; width:800px; text-align: center; padding:0}
-.h2017_about li{ padding:0 ; margin-top: 8px; display:inline}
-.h2017_about li a{color:#6c6c6c;}
-
-#_ideConac{ padding:0!important; vertical-align:middle; position:relative; margin-top:-35px; display:inline-block}
-#imgConac{ width:60px; }
-.h2017_footer p{ text-indent:0}
-.fix3 { padding-bottom:0}
-.fix3 span{ padding:0 5px}
-</style>
-
-
-<div class='h2017_footer'>
-<div class='h2017_about'>
-	<div class='h2017_g_width'>
-		<ul>
-			<!--<li><a href='https://group.hebnews.cn/index.html' rel='nofollow' target="_blank">河北日报报业集团</a> - </li>-->
-			<li><a href='https://help.hebnews.cn/index.html' rel='nofollow'  target="_blank">河北新闻网</a> - </li>
-			<li><a href='https://help.hebnews.cn/bqsm.html' rel='nofollow'  target="_blank">版权声明</a> - </li>
-			<li><a href='https://help.hebnews.cn/fwtk.html' rel='nofollow'  target="_blank">服务条款</a> - </li>
-			<li><a href='https://help.hebnews.cn/ggyw.html' rel='nofollow'  target="_blank">广告业务</a> - </li>
-			<li><a href='https://help.hebnews.cn/sxsq.html' rel='nofollow'  target="_blank">实习申请</a> - </li>
-			<li><a href='https://help.hebnews.cn/wstg.html'  rel='nofollow'  target="_blank">网上投稿</a> - </li>
-			<li ><a href='https://help.hebnews.cn/xwrx.html'  rel='nofollow'  target="_blank">新闻热线</a> - </li>
-			<li  style='border:0; ' ><a href='https://www.hebnews.cn/sitemap.htm'>网站地图</a></li>
-		</ul>
-
-	</div>
-</div>
-	<div class='h2017_g_width'>
-		<div class='h2017_footer_in'>
-			<p class='padding-fix' style="display:none">
-				<span>新闻热线:0311-67563366</span>
-				<span>广告热线:0311-67563019</span>
-				<span>新闻投诉:0311-67562994</span>
-				<span>违法和不良信息举报电话：0311-67563366 邮箱：hbrbwgk@126.com</span>   
-			</p>
-			<p  style="display:none">
-				<span>河北日报广告热线（刊登声明）:0311-67562168</span>
-				<span>燕赵都市报广告热线:0311-86056666</span>
-			</p>
-			<p>
-				<span><a href='http://beian.miit.gov.cn' target='_blank' rel="nofollow">冀ICP备 09047539号-1</a></span> 
-				<span>互联网新闻信息服务许可证编号:13120170002</span> 
-				<span>冀公网安备 13010802000309号</span>
-			</p>
-			<p>
-				<span>广播电视节目制作经营许可证（冀）字第101号</span> |
-				<span>信息网络传播视听节目许可证0311618号</span> |
-              <span><!--<a href='http://sq.ccm.gov.cn/ccnt/sczr/service/business/emark/toDetail/9748adc7a536495b888b73a1eac20cc2' target='_blank' rel='nofollow'>-->冀网文【2021】1825-001号<!--</a>--></span>
-
-			</p>
-			
-			<p>河北新闻网版权所有 本站点信息未经允许不得复制或镜像</p>
-			<p>www.hebnews.cn copyright © 2000 - 2024</p>
-            <p class="fix3">
-				<span><a href='http://www.hbjbzx.gov.cn/' target='_blank' rel='nofollow'><img style="border:1px #ccc solid" src="https://img.hebnews.cn/templateRes/201612/13/88730/88730/20200720.jpg" alt="河北互联网违法和不良信息举报"></a></span>
-				<span><a href='http://beian.miit.gov.cn' target='_blank' rel='nofollow'><img src='https://img.hebnews.cn/attachement/gif/site2/20120823/001aa0c3d91f119fcd371f.gif' alt='经营性备案信息'></a></span>
-
-
-<span><script src='https://dcs.conac.cn/js/05/000/0000/60850566/CA050000000608505660002.js'></script></span>
-
-
-                                
-                                <span><!--<a href='http://sq.ccm.gov.cn:80/ccnt/sczr/service/business/emark/toDetail/9748adc7a536495b888b73a1eac20cc2' rel='nofollow' target='_blank'>--><img src=' https://img.hebnews.cn/88730.files/wenhua.jpg' alt='网络文化经营单位'><!--</a>--></span>
-
-<span><a href='http://www.12377.cn' target='_blank' rel='nofollow'><img src=' https://img.hebnews.cn/86150.files/images/12377_2.jpg' alt='中国互联网举报中心'></a></span>
-  				<span><a href='http://press.gapp.gov.cn/' target='_blank' rel='nofollow'><img src='https://img.hebnews.cn/attachement/gif/site2/20120823/001aa0c3d91f119fcd3721.gif' alt='新闻记者证管核系统'></a></span>
-              
-                
-               
-			</p>
-		</div>
-	</div>
-</div>
-
-<!--纵览分享-->
-<script>
-
-
-
-function isInApp(){
-
-return navigator.userAgent.indexOf("zonglan6756") > -1
+  .redbg {
+    text-align: left;
+    color: rgb(255, 255, 255);
+    width:1000px;
+    height: 2.3em;
+    font: 2.3em/230% 微软雅黑;
+    background: #cc0000;
+    margin: 0px auto !important;
+}  
+body {
+	background:none;
+	margin:0 auto;
+	color:#000;
+}
+.w1280 {
+    width: 100vw;
+}
+.t_fbh_snr {
+		    margin: 1px auto 0px;
+			padding:1rem;
+		}
+		.xwzw_t3 {
+		    padding: 30px 0 40px 0;
+		    margin: 70px 0 0 0;
+		}
+		.xwzw_title {
+		    font-size: 1.2rem;
+		    padding: 0;
+		}
+.ph-body .main, .ct {
+    width: 100%;
+    margin: 0 auto;
+    clear: both;
 }
 
-
-function isAndroid() {
-var u = navigator.userAgent;
-var isAndroid = u.indexOf('Android') > -1 || u.indexOf('Adr') > -1; //android终端
-var isiOS = !!u.match(/\(i[^;]+;( U;)? CPU.+Mac OS X/); //ios终端
-if (isAndroid) {
- return true;
-} else if (isiOS) {
- return false;
+.list_sz {
+    width: 98%;padding-left: 20px;
+  
+ 
 }
+.list_sz p {
+   font: normal 2.2em/200% 微软雅黑;
+    margin: 8px 0;width: 900px;padding-left: 25px;text-align: justify;
 }
 
-// 交互
-function connectWebViewJavascriptBridge(callback) {
-// android
-if (window.WebViewJavascriptBridge) {
- return callback(WebViewJavascriptBridge);
-} else {
- document.addEventListener('WebViewJavascriptBridgeReady', function () {
-     callback(WebViewJavascriptBridge);
- }, false);
-}
-// ios
-if (window.WVJBCallbacks) {
- return window.WVJBCallbacks.push(callback);
-}
-window.WVJBCallbacks = [callback];
-var WVJBIframe = document.createElement('iframe');
-WVJBIframe.style.display = 'none';
-WVJBIframe.src = 'wvjbscheme://__BRIDGE_LOADED__';
-document.documentElement.appendChild(WVJBIframe);
-setTimeout(function () {
- document.documentElement.removeChild(WVJBIframe);
-}, 10);
+.footer {
+    width: 1000px;
+    margin: 0 auto;
+    border-top: none;
+    clear: both;
+    overflow: hidden;
 }
 
 
 
+.biaoz2 {
+    width: 1000px;
+    float: left;
+    color: red;
+    text-align: center;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #0052B2;
+}
+
+.list_sz span {
+     text-align: right;
+    padding-right:50px;  font: bold 2em/150% 微软雅黑;
+ width: 1000px;
+}
+
+
+.bd h2 {
+     font: bold 1.3em/150% 微软雅黑;
+    font-weight: bold;
+    color: #7d7d7d;
+    padding-bottom: 25px;
+    border-bottom: 1px solid #0052B2;
+ padding-left: 35px
+
+}
 
 
 
-connectWebViewJavascriptBridge(function (bridge) {
-    console.log('isAndroid');
-    // Initialize for Android
-    if (isAndroid()) {
-        bridge.init(function (message, responseCallback) {});
-    }
+.bd {
+    width: 1000px;
+    float: left;
+    padding: 0 !important;
+}
 
-    if (isInApp()) {
-        // Fetch content from the HTML elements
-        var shareTitle = document.getElementById('shareTitle').innerText;
-        var shareContent = document.getElementById('shareDesc').innerText;
-        var shareImg = document.querySelector('#content img').src; // Assuming there's only one image inside the #content div
+.list_h 
 
-        let tempJson = {
-            "enableShare": "0",
-            "shareTitle": shareTitle,
-            "shareContent": shareContent,
-            "shareImg": shareImg,
-            "shareUrl": '' // You can set this if there's a specific URL to share
-        };
+{
+    width: 100%;
+    border-bottom:0px solid #0052B2;
+}
 
-        // Trigger the appropriate bridge call
-        if (isAndroid()) {
-            // Android
-            bridge.callHandler('setShareMsg', JSON.stringify(tempJson), function (str) {});
-        } else {
-            // iOS
-            bridge.callHandler('setShareMsg', tempJson, function (str) {});
+.list_h h2 {
+   
+     text-align: left;
+   font: bold 1.8em/150% 微软雅黑;
+    color: #18559f;
+    width:100%;
+border-bottom:0px solid #0052B2;
+
+padding-bottom:20px;
+}
+
+
+
+    
+ .logoh{ display:none;}
+.head{ display:none;}   
+  .bg_topbg { display:none;} 
+ .ph-bd { display:none;}  
+   .c { width:1000px; } 
+.info  { display:none;}
+.w1200 { display:none;}
+.list_h h4{ line-height: 36px;
+    float: left; font: 1em/150% 微软雅黑;letter-spacing:1px;
+    text-align: center;
+    margin: 0px !important;
+    border-bottom: 1px solid #0052B2;
+    padding-bottom: 20px;}
+
+ .list_h h3{  
+        font: 0.9em/150% 微软雅黑;
+    float: left;
+    width: 100%;
+    line-height: 55px;
+    text-align:justify;
+    text-indent: 2em;
+    color: #504b4b;
+    padding-bottom: 20px;
+}
+.list_h_wx,.sharewx { display:none;}
+}
+@media screen and (min-width:0px) and (max-width: 915px) {
+.list ul li a {
+    display: block;
+    float: none;
+}
+.list ul li span {
+    display: block;
+    float: none;
+}
+iframe {width:100%;max-height:220px;margin:0 auto;}
+}
+@media screen and (orientation:landscape) and (max-width: 1023px){
+        .xwzw_title {
+            font-size: 0.8rem;
         }
-    }
-});
-
-
-</script>
-<!--纵览分享-->
-
-
-	
-	
-	
-	
-<!--视频浮动-->
-	  <script type="text/javascript">
-    // 获取所有audios
-    var audios = document.getElementsByTagName("video");
-    // 暂停函数
-    function pauseAll() {
-        var self = this;
-        [].forEach.call(audios, function(i) {
-            // 将audios中其他的audio全部暂停
-            i !== self && i.pause();
-        })
-    }
-    // 给play事件绑定暂停函数
-    [].forEach.call(audios, function(i) {
-        i.addEventListener("play", pauseAll.bind(i));
-    })
-
-
-var videoElement = document.getElementById("videofloat");
-videoElement.addEventListener('loadedmetadata', function(e){
-$("#videobox").css("height",videoElement.offsetHeight);
-$("#videobox").css("width",videoElement.offsetWidth);
-
-});
+        .xwzw_t2 {
+            font-size:0.5rem;
+            line-height: 2;
+        }
+        .t_fbh_st,.xwzw_t1 .fontSize {font-size:0.4rem;}
+}
+  </style>
+	</head>
+	<body style="background:#f4f4f4;">
 		
-		  
-		  
-	</script>	
-	<script type="text/javascript" src="https://img.hebnews.cn/templateRes/201612/15/88932/88932/videofloat.js"></script>
+	<!DOCTYPE html>
+<html>
+	<head>
+                <meta http-equiv="pragma" content="no-cache">
+                <meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
+                <meta http-equiv="expires" content="0">
+		<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+		<meta name="apple-mobile-web-app-capable" content="yes">
+		<meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+                
+		<title>${channel_name!""}</title>
+		<meta name="keywords" content="东北新闻网">
+		<meta itemprop="name" content="东北新闻网">
+		<style type="text/css">
+.ph-bd {
+    background: #f4f4f4;
+    padding: 15px 0;    
+}
+.ph-bd-top {
+    background: #fcfcfc;
+    padding: 15px 0;
+}
+.logoh {
+    width: 1280px;
+    height: auto;
+    clear: both;
+    overflow: hidden;
+    margin: 0 auto 0;
+    position: relative;
+    background:none;
+    
+}
+.logow{width:310px;float:left;}
+.logow img{width:310px;height:74px;}
+.logo {
+    width: 315px;
+    height: 85px;
+    background: url(/channel-home/nen/images/logo.png) left 3px no-repeat;
+    float: left;
+}
+.nav {
+    width: 1200px;
+    height: 113px;
+    clear: both;
+    margin: 0 auto 10px;
+    position: relative; 
+}
 
-<!--视频浮动-->
-	
-	
-<!--新闻网自己的统计 -->
+.navBox {
+    width:800px;
+    height:auto;
+    line-height:25px;
+    float:left;
+    font-size:18px;
+    margin-top: 10px;
+    display:flex;
+    flex-wrap:wrap;
+    margin-left: 10px;
+}
+.navBox a {
+    flex-grow:0;
+    flex-shrink:0;
+    flex-basis:auto;
+    font-size: 18px;
+    text-align:left;
+}
+.navBox a:nth-of-type(1),.navBox a:nth-of-type(4),.navBox a:nth-of-type(5),.navBox a:nth-of-type(6),.navBox a:nth-of-type(7),.navBox a:nth-of-type(8) {
+    flex-basis:66px;
+}
+.navBox a:nth-of-type(2) {
+    flex-basis:107px;
+}
+.navBox a:nth-of-type(3) {
+    flex-basis:105px;
+}
+.navBox a:nth-of-type(9) {
+    flex-basis:90px;
+}
+.navBox a, .navBox span {
+    float:left;
+    margin-top:0px;
+    margin-right:5px;
+}
+.navBox span {
+    float:none;
+    margin-top:0px;
+    margin-right:6.8px;
+    margin-left:6.8px;
+}
+.navBox .in{padding-right:12px;}
+.navBox .it{padding-right:12px;}
+.navBox .tjy {padding-right: 14px;}
+.navthreen {
+    width: 760px;
+    height: auto;
+    float: left;
+    margin-left: 5px;
+}
+.top_listone {
+    width: 970px;
+    height:auto;
+    background:#f3f3f3;
+    float: right;
+    margin-left: 0;
+}
+.navrightjb {
+    width: 200px;
+    height: auto;
+    float: right;
+}
+.w300 {width: 290px;margin-top: 10px;}
+.search {
+    width: 20%;
+}
+
+.search .search-name {
+    float: left;
+    display: block;
+    font-size: 14px;
+    line-height: 30px;
+    color: #083b90;
+}
+
+.search .search-box {
+    float: none;
+    width: 100%;
+    height: 28px;
+    padding-left: 12px;
+    -webkit-box-sizing: border-box;
+    -moz-box-sizing: border-box;
+    box-sizing: border-box;
+    -webkit-border-radius: 15px;
+    -moz-border-radius: 15px;
+    border-radius: 15px;
+    border: none;
+    background: #fff;
+    box-sizing: border-box;
+}
+
+.search .search-box .search-input {
+    display: block;
+    float: left;
+    line-height: 26px;
+    width: 150px;
+    height: 26px;
+    font-size: 14px;
+    outline: 0;
+    border: 0;
+    color: #8d9fab;
+}
+
+.search .search-box .search-btn {
+    float: right;
+    width: 55px;
+    height: 28px;
+    -webkit-border-radius: 15px;
+    -moz-border-radius: 15px;
+    border-radius: 15px;
+    background: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAA4AAAAOCAYAAAAfSC3RAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAAyZpVFh0WE1MOmNvbS5hZG9iZS54bXAAAAAAADw/eHBhY2tldCBiZWdpbj0i77u/IiBpZD0iVzVNME1wQ2VoaUh6cmVTek5UY3prYzlkIj8+IDx4OnhtcG1ldGEgeG1sbnM6eD0iYWRvYmU6bnM6bWV0YS8iIHg6eG1wdGs9IkFkb2JlIFhNUCBDb3JlIDUuNi1jMTM4IDc5LjE1OTgyNCwgMjAxNi8wOS8xNC0wMTowOTowMSAgICAgICAgIj4gPHJkZjpSREYgeG1sbnM6cmRmPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5LzAyLzIyLXJkZi1zeW50YXgtbnMjIj4gPHJkZjpEZXNjcmlwdGlvbiByZGY6YWJvdXQ9IiIgeG1sbnM6eG1wPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvIiB4bWxuczp4bXBNTT0iaHR0cDovL25zLmFkb2JlLmNvbS94YXAvMS4wL21tLyIgeG1sbnM6c3RSZWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9zVHlwZS9SZXNvdXJjZVJlZiMiIHhtcDpDcmVhdG9yVG9vbD0iQWRvYmUgUGhvdG9zaG9wIENDIDIwMTcgKFdpbmRvd3MpIiB4bXBNTTpJbnN0YW5jZUlEPSJ4bXAuaWlkOkUzNDJDMTUzQzFFQjExRUJBODk4RkQ5MTlBMzBDMUVBIiB4bXBNTTpEb2N1bWVudElEPSJ4bXAuZGlkOkUzNDJDMTU0QzFFQjExRUJBODk4RkQ5MTlBMzBDMUVBIj4gPHhtcE1NOkRlcml2ZWRGcm9tIHN0UmVmOmluc3RhbmNlSUQ9InhtcC5paWQ6RTM0MkMxNTFDMUVCMTFFQkE4OThGRDkxOUEzMEMxRUEiIHN0UmVmOmRvY3VtZW50SUQ9InhtcC5kaWQ6RTM0MkMxNTJDMUVCMTFFQkE4OThGRDkxOUEzMEMxRUEiLz4gPC9yZGY6RGVzY3JpcHRpb24+IDwvcmRmOlJERj4gPC94OnhtcG1ldGE+IDw/eHBhY2tldCBlbmQ9InIiPz71eop8AAABsElEQVR42mL8//8/Aww8ePjY8fDhk7UgGiYmLS1x0trKrF1dTXkjAxJghGncsXP/5NNnLuSA2Jqaqmv4+fgeff78Rfra9VuhQDVM2lrqK4MCvSLgOkEat27bM72ppe///gNHm0B8dHzk6MlKkPzylRs2w8QYnj59bgYS3LvvSBs2TQjNpypA6q5euxkG4jMBbZvJyMj4z8nRuooBD7C2Mu1gY2P7vG373ukgPtOLl68NNDVU1zAQAXR1NZd8//5D6MePnwJMIAEREaHrxGgUEuS/A6K/fPkqCdb4EmgrMRrfvHmnBaK5ubleMklIiJ2/eeuuPzEar1y9GcHOzvaJk5PjHZOnh1M2SBAUSPg07dl7uOv379/cnh7OWSA+i4y05HEjQ93Z585fTgMlCBdnuxKQqTANIMV79x9pP336Qi6Iz8vL/Qwl5QBtnAXUnApiy8pKH+Hn4330+csXqYcPnzgg28zBwf4hKyNBgxE5rd6799Dt6PHT5Q8ePHZCpFXJEzbWZm2g5AeLQ2FhwZsoGpHT8I8fPwSAEf6FiYnpN0wQmMostu3YN+3Dh08KAAEGAMAv85XozbtPAAAAAElFTkSuQmCC) center center no-repeat;
+    cursor: pointer;
+}
+.search_icon1{background:url(/channel-home/nen/images/w40.png) no-repeat left center;padding:0 0 0 20px;margin:0 0 0 10px;}
+.search_icon2{color: #ff0000;background:url(/channel-home/nen/images/w41.png) no-repeat left center;padding:0 0 0 20px;margin:0 0 0 10px;}
+.gsgg {color: #ff0000;background:url(/channel-home/nen/images/w47.png) no-repeat left center;padding:0 0 0 20px;margin:0;}
+
+.left {
+    float: left;
+}
+.right {
+    float: right;
+}
+.clearfix {
+    display: block;
+}
+.weather {
+    width: 80px;
+    height: 26px;
+    line-height: 26px;
+    margin: 0 10px;
+    text-align: center;
+}
+.emall {
+    margin-left: 40px;
+    width: 30px;
+    height: 30px;
+    float: left;
+    border: 0;
+}
+.emall img {
+    border: 0;
+}
+.telephone {
+    width: 150px;
+    height: 30px;
+    float: left;
+    margin-left: 20px;
+}
+.logow {width:auto;}
+.logow img {width:auto;}
 
 
-<script type="text/javascript" src="https://img.hebnews.cn/amucsite/stat/WebClick.js"></script>
-<input  type="hidden" id="DocIDforCount" name="DocIDforCount" value="9254045">
+		</style>
+	</head>
+	<body>
+<div class="ph-bd-top">
+<div class="logoh">
+    <div class="clearfix">
+						<div class="tb_text left"><p style="width:100px;float:left;margin:0px"><span id="localtime"></span></p><a href="http://www.nen.com.cn/channel-home/tgyx/tg.shtml" class="search_icon2">投稿邮箱</a></div>
+						<div class="tb_text left" style="padding:0 0 0 30px;">
+                                                    <span style="display:inline-block;">新闻热线 024-23187042</span> 
+                                                    <span style="display:inline-block; padding-left:6px;">值班电话 024-23186204</span>
+                                                </div>
+                                                <div class="tb_text left" style="padding:0 0 0 30px;">
+                                                    <span style="display:inline-block;"><a href="http://gsgg.nen.com.cn" target="_blank" class="gsgg">公示公告频道招商：</a>  024-23186593</span>
+                                                </div>
+						<div class="search right clearfix searchPos ">
+							<div class="clearfix form search-box" id="f1">
+								<input class="search-input" id="inputwd" type="text"
+								onmouseoff="this.className='input_off'" autocomplete="off" maxlength="255"
+								value="" name="wd" placeholder="搜索" data-inputcolor="#9c9c9c" />
+								<a href="/channel-home/search/search.shtml"><div class="search-btn" id="searchSubmit" type="submit" name="btn" value=""></div></a>
+							</div>
+						</div>
+					</div>
+</div>
+</div>
+<div class="ph-bd">
+			<!--顶部导航-->
+			<div class="logoh">
+			  <div class="logow">
+                                
+                                <div style="float:left;"><a href="http://www.nen.com.cn/"><img src="/channel-home/nen/images/w37nen.png" alt="东北新闻网" /></a></div>
+                            <div style="float:left;"><a href="http://www.nen.com.cn/channel-home/bdrm/bdrm.shtml" target="_blank"><img src="/channel-home/nen/images/w37bd.png" alt="北斗融媒" /></a></div>
+                          </div>
+			  <div class="top_listone">
+			  <div class="navthreen fwryh">
+				<div class="navBox">
+			    	    <a href="http://liaoning.nen.com.cn" target="_blank">辽宁</a>
+                                    <a href="http://review.nen.com.cn" target="_blank">北斗时评</a>
+                                    <a href="http://ms.nen.com.cn" target="_blank"><span style="float:none;margin:0;letter-spacing:4px;margin-left:4px;">民生帮</span></a>
+                                    <a href="http://zt.nen.com.cn/" target="_blank">专题</a>
+                                    <a href="http://health.nen.com.cn/" target="_blank">健康</a>
+                                    <a href="http://finance.nen.com.cn" target="_blank">财经</a>
+                                    <a href="http://job.nen.com.cn/" target="_blank">人才</a>
+                                    <a href="http://piyao.nen.com.cn/" target="_blank">辟谣</a>
+                                    <a href="http://wmln.nen.com.cn" target="_blank">文明辽宁</a>
+    			    </div>
+                                <div class="navBox">
+                                    <a href="http://news.nen.com.cn" target="_blank">新闻</a>
+                                    <a href="http://video.nen.com.cn/" target="_blank">融<span>·</span>视频</a>
+                                    <a href="http://xiaofei.nen.com.cn" target="_blank">消费维权</a>
+                                    <a href="http://nongye.nen.com.cn/" target="_blank">农业</a>
+                                    <a href="http://liaoning.nen.com.cn/network/liaoningnews/lnnewskejiao/list/indexHome.shtml" target="_blank">科技</a>
+                                    <a href="http://edu.nen.com.cn/" target="_blank" style="flex-basis: 62px;">教育</a>
+                                    <a href="http://zfcg.nen.com.cn/" target="_blank" style="flex-basis: 141px;">政府采购/拍卖</a>
+                                    <a href="http://gsgg.nen.com.cn/" target="_blank" style="flex-basis: 90px;">公示公告</a>
+    			    </div>
+			  </div>
+                          <div class="navrightjb">
 
-<!--
+					
+
+					<div class="clearfix phoneNone" style="float:right;"><a href="http://piyao.nen.com.cn/" target="_blank"><img src="/channel-home/nen/images/w38-syr-2.jpg"></a></div>
+				</div>
+			</div>
+			</div>
+			<!--顶部导航结束-->
+			</div>
+	</body>
 <script type="text/javascript">
-  jQuery(document).ready(function() {
-    jQuery('.sidefixed').theiaStickySidebar({
-      additionalMarginTop: 10,
-	  containerSelector:'.sidefixedline',
-      additionalMarginBottom:450,
-	  
-    });
-  });
+function showLocale(objD){
+	var str,colorhead,colorfoot;
+	var yy = objD.getYear();
+	if(yy<1900) yy = yy+1900;
+	var MM = objD.getMonth()+1;
+	if(MM<10) MM = '0' + MM;
+	var dd = objD.getDate();
+	if(dd<10) dd = '0' + dd;
+	var hh = objD.getHours();
+	if(hh<10) hh = '0' + hh;
+	var mm = objD.getMinutes();
+	if(mm<10) mm = '0' + mm;
+	var ss = objD.getSeconds();
+	if(ss<10) ss = '0' + ss;
+	var ww = objD.getDay();
+	if  ( ww==0 )  colorhead="<font color=\"#000000\">";
+	if  ( ww > 0 && ww < 6 )  colorhead="<font color=\"#000000\">";
+	if  ( ww==6 )  colorhead="<font color=\"#000000\">";
+	if  (ww==0)  ww="星期日";
+	if  (ww==1)  ww="星期一";
+	if  (ww==2)  ww="星期二";
+	if  (ww==3)  ww="星期三";
+	if  (ww==4)  ww="星期四";
+	if  (ww==5)  ww="星期五";
+	if  (ww==6)  ww="星期六";
+	colorfoot="</font>"
+	str = colorhead + yy + "." + MM + "." + dd + " " + colorfoot;
+	return(str);
+}
+
+function tick(){
+	var today;
+	today = new Date();
+	document.getElementById("localtime").innerHTML = showLocale(today);
+	window.setTimeout("tick()", 1000);
+}
+
+tick();
+
 </script>
--->
-</body>
 </html>
 
+			
+		
+		
+		
+            <div class="t_fbh_st_bg">
+			<div class="w1280 t_fbh_st">您当前的位置 ：<a href='http://www.nen.com.cn'>东北新闻网</a>>><a href='http://nongye.nen.com.cn/network/nypd/index.shtml'>农业频道</a>>><a href='http://nongye.nen.com.cn//network/nypd/nyyw/index.shtml'>农业要闻</a></div>
+		</div>
+        
+        <div class="w1280 t_fbh_snr">
+            <div class="list_h">
+         <div class="xwzw_title">辽宁省2024年高素质农民培育省级重点班开班</div>
+
+   <h2></h2>
+   <h3></h3>
+         <div class="xwzw_t1">
+            <span class="fontSize">2024-10-28 09:54:09</span>
+            <span class="fontSize">&nbsp;&nbsp;&nbsp;来源：辽宁日报</span>
+            <span class="sharewx" style="position:relative;">
+                    分享到:<img src="/channel-home/nen/images/weixin.png" id="share">
+                    <input type="hidden" id="url" value="" />
+                    <div id="qrcode" style="display: none;">
+			<span style="font-size: 12px;text-align: center;">
+				用微信扫码二维码<br/>
+				分享至好友和朋友圈
+			</span>
+		    </div>
+                </span>
+        </div>
+        </div>
+         
+		
+            
+                <div class="xwzw_t2">
+                    
+                    <p>
+                        <p>　　近日，辽宁省2024年高素质农民培育省级重点班——辽宁省畜牧特色产业农业经理人班在鞍山市正式开班。</p><p>　　今年，我省高素质农民培育省级重点班重点面向承担粮油种植、农机作业及畜牧、食用菌等产业的种养大户、农机大户、家庭农场主、农业社会化服务主体负责人，返乡创业创新人员以及农业国际贸易与投资经纪人等开展培育。全省培育各类经营管理型高层次人才1000名，其中围绕粮油单产提升专题培训行动培育粮油生产高层次人才800人;围绕畜牧、食用菌和农业国际贸易与投资培训需求培育相关高层次人才200人。</p><p>　　为确保培训取得实效，此次省级重点班创新培育模式，全程抓培育过程监管，以便发挥好省级重点班的示范引领作用。在班型模块设置上，构建起综合素养、专业技能、能力拓展3个培训模块，线上线下融合培训;在课程内容设置上，紧紧围绕农业发展主导产业、优势特色产业人才需求，坚持课堂培训与实习实训并举，遴选并深入现代农业园区、农业龙头企业、新型农业经营主体等，提高培训质量和效果。</p><p>　　(记者 胡海林)</p><p><br/></p>
+                    </p>
+                    <div style="text-align:right;">责任编辑：宋军</div>
+                </div>
+                
+                <div class="list">
+                    
+                    <ul>
+                     </ul>
+                </div>
+
+                <div class="erweima" style="width:100%;margin:80px auto -40px auto;float:none;overflow:hidden;">
+			<div style="width:50%;float:left;">
+                            <p><img src="/channel-home/nen/images/w15.jpg"></p>
+                            <p>东北新闻网微博</p>
+                        </div>
+			<div style="width:50%;float:left;">
+                            <p><img src="/channel-home/nen/images/w16.jpg"></p>
+                            <p>北斗融媒</p>
+                        </div>
+		</div>
+                <div class="xwzw_t3">
+                    <p>*本网站有关内容转载自合法授权网站，如果您认为转载内容侵犯了您的权益，<br>
+                       请您来信来电(024-23187042)声明，本网站将在收到信息核实后24小时内删除相关内容。
+                       </p>
+               </div>
+              
+            
+        </div>
+		<div class="ct">
+			 <!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+		<meta name="apple-mobile-web-app-capable" content="yes">
+		<meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+              
+                <meta http-equiv="pragma" content="no-cache">
+                <meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
+                <meta http-equiv="expires" content="0">
+		<title>${channel_name!""}</title>
+		<meta name="keywords" content="东北新闻网">
+		<meta itemprop="name" content="东北新闻网">
+		<style type="text/css">
+			
+			/**************** footer *************/
+			.footer {
+    width: 1280px;
+    margin: 0 auto;
+    border-top: none;
+    clear: both;
+    overflow: hidden;
+}
+			/* fNav */
+			.fNav_Box {
+				width:1200px;
+				margin:15px auto 10px;
+				border-bottom:1px dashed #ccc;
+				clear:both;
+				overflow:hidden;
+			}
+			.fNav, .fNav_info {
+				float:left;
+				_display:inline;
+				width:150px;
+				height:75px;
+				margin-left:14px;
+				margin-bottom:15px;
+				font-size:12px;
+				padding:10px 0;
+			}
+			.fNav {
+				line-height:25px;
+				background:#E8E8E8;
+			}
+			.fNav:hover {
+				background:#033266;
+				color:#fff;
+			}
+			.fNav:hover a{
+				color:#fff;
+			}
+			.fNav strong {
+				display:block;
+				margin:0 0 0 15px;
+			}
+			.fNav strong a {
+				width:auto;
+				margin-left:0;
+			}
+			.fNav a {
+				display:inline-block;
+				width:52px;
+				margin-left:15px;
+				white-space:nowrap;
+			}
+			.fLinks {
+				margin:0 auto 10px;
+				clear:both;
+				overflow:hidden;
+				padding-bottom:10px;
+				font-size:14px;
+			}
+			.fLinks h3 {
+				width:100%;
+				height:30px;
+				font-size:16px;
+				font-weight:bold;
+				color: #2e5389;
+				
+			}
+			.fLinks a {
+				margin-right:13px;
+			        line-height: 30px;
+			}
+			.info {
+				border-bottom:1px dashed #ccc;
+				padding:15px 0;
+			}
+			.fnav {text-align:center;}
+			.crBox {
+				width:100%;
+				height:25px;
+				line-height:25px;
+				background:#303030;
+			}
+			.cR {
+				width:1000px;
+				height:25px;
+				line-height:25px;
+				color:#fff;
+				text-align:center;
+				margin:0 auto;
+			}
+			.focus {
+				width:320px; 
+				height:220px; 
+				margin-bottom:10px;
+			}
+			/*底部*/
+			.footernew{color:#515151;font-size:12px;margin: 30px auto;overflow:hidden;text-align:center;}
+			.footheight{width:80%;display: flex;
+    overflow: hidden;
+    align-items: center;
+    justify-content: space-around;}
+.fnav a {padding:0 5px; font-size:14px;}
+			.footernew a{color:#515151;text-decoration:none;}
+			.footernew a.lchot{color:#BD0A01;}
+			.footernew a:hover{color:#BD0A01;text-decoration:underline;}
+			.footernew a:visited{color:#515151;}
+			.footernew div{margin:0 auto;}
+			.footernew p{width:170px;border:1px solid #D2D2D2;float:left;font-size:12px;margin:6px;padding:0;text-align:center;overflow:hidden;}
+			.footernew .fl{width:24%;float:left;padding:10px 0 0 0;}
+                        .footernew p:nth-of-type(6) .fl{padding:5px 0 0 0;}
+			.footernew .fr{width:74%;float:right;padding:5px 0px 0 0;}
+.footernew .fr .lcblack{line-height:40px;}
+.footernew p:nth-of-type(1) img,.footernew p:nth-of-type(2) img,.footernew p:nth-of-type(3) img {width: 100%;height: 100%;}
+.footernew p:nth-of-type(4) img,.footernew p:nth-of-type(5) img {width: 80%;}
+.footernew p:nth-of-type(6) img {width: 70%;}
+	
+
+
+
+		
+		@media screen and (max-device-width :960px)  {
+html {font-size: calc(100vw / 18.75);}
+.footer {
+    width: 100%;
+}
+.footernew p {width:49%;height:2rem;font-size:0.6rem;margin:0.1rem 0;line-height: 1rem;}
+    .footernew .fl{width:25%; padding:0; margin-left:0.2rem;}
+
+    .footernew p:nth-of-type(1) img,.footernew p:nth-of-type(2) img,.footernew p:nth-of-type(3) img {width:100%;height:100%;}
+    .footernew p:nth-of-type(4) img,.footernew p:nth-of-type(5) img {width:60%;}
+    .footernew p:nth-of-type(6) img {width:50%;}
+    .footernew p:nth-of-type(4) .fl{margin-top:0.2rem;}
+    .footernew p:nth-of-type(5) .fl{margin-top:0.2rem;}
+    .footernew p:nth-of-type(6) .fl{margin-top:0rem;}
+    .footernew .fr{padding:0;margin-top:0rem;margin-right:0.2rem;}
+    .footernew .fr .lcblack{line-height:2rem;}
+    .footernew p:nth-of-type(4) .fr{width: 67%;margin-top:0rem;}
+    .footernew p:nth-of-type(5) .fr{width: 60%;margin-top:0rem;margin-right:0.6rem;}
+    .footernew p:nth-of-type(6) .fr{width: 60%;margin-top:0rem;margin-right:0.6rem;}
+    .footheight{width: 98%;display: flex;flex-wrap: wrap;overflow: hidden;align-items: center;justify-content: space-around;}
+
+
+}
+	
+		</style>
+	</head>
+	<body>
+			<!-- footer -->
+			<div class="footer">
+<div class="fbg">
+			<div class="info fnav" style="text-align:center;background: none !important;">
+<a href="http://www.nen.com.cn/channel-home/gywm/gywm.shtml" target="_blank">关于我们</a>
+<a href="http://www.nen.com.cn/channel-home/tgyx/tg.shtml" target="_blank">投稿邮箱</a>
+<a href="http://www.nen.com.cn/channel-home/ggbj/ggbj.shtml" target="_blank">广告报价</a>
+<a href="http://www.nen.com.cn/channel-home/lianxiwomen/lianxi.shtml" target="_blank">联系我们</a>
+
+			</div>
+<div class="fnav" style="background: none !important;">—  辽宁北斗云数字科技技术支持  —</div>
+			<div class="fnav" style="background: none !important;">
+<span class="spanBlock "><a href="https://beian.miit.gov.cn/" target="_blank">辽ICP备2021005258号-1</a></span>
+<!-- <span class="spanBlock ">增值电信业务经营许可证</span> --> 
+<!-- <span class="spanBlock ">辽B1.B2-20150111 </span> --> 
+<span class="spanBlock ">互联网新闻信息服务许可证</span>
+<span class="spanBlock ">21120170001</span>
+<span class="spanBlock ">信息网络传播视听节目许可证 0603017</span>
+<p style="text-align:center;margin:0 10px;">东北新闻网(www.nen.com.cn)版权所有，未经授权禁止复制或建立镜像</p>
+</div>
+<div class="cb"></div>
+</div>
+			<div class="footernew footheight">
+                                        <p>
+                                                <a href="https://www.12377.cn/" target="_blank"><img src="/channel-home/nen/images/w30.jpg?v=20210906" alt="" /></a>
+                                        </p>
+                                        <p>
+                                                <a href="https://www.lnjubao.cn/" target="_blank"><img src="/channel-home/nen/images/w30-1.jpg" alt="" /></a>
+                                        </p>
+				        <p>
+					<a href="http://www.12377.cn/node_548446.htm" target="_blank">
+						<img border="0" alt="举报专区" src="/channel-home/nen/images/newjubao20150205.jpg"></a>
+					</p>
+					<p>
+						<span class="fl"><img border="0" alt="辽公网安备21010202000026号" src="/channel-home/nen/images/jd.gif"></span>
+						<span class="fr"><a href="http://www.beian.gov.cn/portal/registerSystemInfo?recordcode=21010202000026" target="_blank">辽公网安备<br>21010202000026号</a></span>
+					</p>
+					<p>
+						<span class="fl"><img border="0" alt="沈网警备案20040314号" src="/channel-home/nen/images/jd.gif"></span>
+						<span class="fr">沈网警备案<br>20040314号</span>
+					</p>
+					<p>
+						<span class="fl"><a href="http://ln.cyberpolice.cn/alertPawsAction.do?method=LOUT" target="_blank"><img border="0" alt="辽宁网警" src="/channel-home/nen/images/sywj.gif"></a></span>
+						<span class="fr"><a class="lcblack" href="http://ln.cyberpolice.cn/alertPawsAction.do?method=LOUT" target="_blank" rel="nofollow">辽宁网警</a></span>
+					</p>
+				</div>
+			</div>
+			<!-- footer end --> 
+	
+	</body>
+</html>
+
+		</div>
+<script src="/channel-home/nen/js/jquery.min.js"></script>
+	<script src="/channel-home/nen/js/qrcode.js"></script>
+<script src="/channel-home/nen/js/nrimg.js?v=1.0.3"></script>
+	<script type="text/javascript">
+		$(function(){
+                        $('iframe').attr('scrolling','no');
+			$('#url').val(window.location.href);
+			
+			var qrcode = new QRCode("qrcode");
+			// 生成二维码的方法
+			function makeCode () {
+				// 二维码地址 
+				var Url = document.getElementById("url");
+				if (!Url.value) {
+					alert("请输入生成二维码的地址");
+					Url.focus();
+					return;
+				}
+				qrcode.makeCode(Url.value);
+			}
+			makeCode();
+			
+			$('#share').on('click',function(){
+				let temp = $('#qrcode').css('display');
+				if(temp=='block') {$('#qrcode').hide()};
+				if(temp=='none') {$('#qrcode').show()};
+			});
+		});
+	</script>
+	</body>
+</html>
 
     """
     

@@ -11,6 +11,17 @@ logger.add("file_{time}.log")
 
 class XPathHTMLAnalyzer:
     """分析HTML中body下两层深度的元素结构，生成XPath，分析链接和文本比例，以及检测视频播放器"""
+    # HTML清理相关的正则表达式模式
+    PATTERNS = {
+        'script': r'<[ ]*script.*?\/[ ]*script[ ]*>',  # 移除脚本标签
+        'style': r'<[ ]*style.*?\/[ ]*style[ ]*>',    # 移除样式标签
+        'meta': r'<[ ]*meta.*?>',                      # 移除meta标签
+        'comment': r'<[ ]*!--.*?--[ ]*>',             # 移除HTML注释
+        'link': r'<[ ]*link.*?>',                     # 移除link标签
+        'base64_img': r'<img[^>]+src="data:image/[^;]+;base64,[^"]+"[^>]*>',  # 替换base64图片
+        'svg': r'(<svg[^>]*>)(.*?)(<\/svg>)',         # 替换SVG内容
+        'base64_content': r'data:image/[^;]+;base64,[^"]+'  # 检测base64内容
+    }
     
     def __init__(self):
         self.semantic_tags = {
@@ -56,6 +67,55 @@ class XPathHTMLAnalyzer:
                 r'player\.bilibili\.com'
             ]
         }
+        # 添加可见性检查的配置
+        self.invisible_tags = {'script', 'style', 'link', 'meta'}
+        self.invisible_classes = {'hide', 'hidden'}
+
+    def is_visible(self, tag: Tag) -> bool:
+        """统一的可见性检查方法"""
+        if not isinstance(tag, Tag):
+            return False
+            
+        if tag.name in self.invisible_tags:
+            return False
+            
+        style = tag.get('style', '').lower()
+        if 'display:none' in style or 'visibility:hidden' in style:
+            return False
+            
+        classes = {cls.lower() for cls in tag.get('class', [])}
+        if classes & self.invisible_classes:  # 使用集合交集判断
+            return False
+            
+        return True
+
+    def get_xpath_x(self, element: Tag) -> str:
+        """获取元素的XPath路径"""
+        components = []
+        child = element
+        
+        while child and child.parent:
+            # 获取当前元素在同类型兄弟节点中的位置
+            siblings = child.parent.find_all(child.name, recursive=False)
+            if len(siblings) > 1:
+                # 处理可能的非闭合标签，使用更可靠的方式计算位置
+                position = 0
+                for sibling in siblings:
+                    if sibling is child:
+                        break
+                    position += 1
+                components.append(f'{child.name}[{position + 1}]')
+            else:
+                components.append(child.name)
+            
+            child = child.parent
+            # 如果父元素是[document]，停止遍历
+            if isinstance(child, BeautifulSoup):
+                break
+        
+        # 反转路径并组合
+        xpath = '//' + '/'.join(reversed(components))
+        return xpath
 
     def get_xpath(self, element: Tag) -> str:
         """生成元素的XPath路径"""
@@ -109,7 +169,10 @@ class XPathHTMLAnalyzer:
         return video_links
 
     def detect_video_player(self, element: Tag) -> Dict:
-        """检测元素是否是视频播放器"""
+        """简化的视频播放器检测"""
+        if not self.is_visible(element):
+            return {'is_player': False}
+            
         result = {
             'is_player': False,
             'player_type': None,
@@ -119,87 +182,156 @@ class XPathHTMLAnalyzer:
         
         # 检查标签名
         if element.name in self.video_player_patterns['tags']:
-            result['is_player'] = True
-            result['player_type'] = self.video_player_patterns['tags'][element.name]
+            result.update(self._check_video_tag(element))
             
-            # 收集视频源信息
-            if element.name == 'video':
-                sources = element.find_all('source')
-                if sources:
-                    result['details']['sources'] = [
-                        {'src': src.get('src', ''), 'type': src.get('type', '')}
-                        for src in sources
-                    ]
-                else:
-                    result['details']['src'] = element.get('src', '')
-                result['source_type'] = 'native'
-                
-            elif element.name == 'iframe':
-                src = element.get('src', '')
-                result['details']['src'] = src
-                # 检查是否是已知的视频平台
-                for pattern in self.video_player_patterns['src_patterns']:
-                    if re.search(pattern, src):
-                        result['source_type'] = 'embedded'
-                        break
-        
-        # 检查类名
-        classes = element.get('class', [])
-        matching_classes = [c for c in classes if any(
-            pattern.lower() in c.lower() 
-            for pattern in self.video_player_patterns['classes']
-        )]
-        if matching_classes:
-            result['is_player'] = True
-            result['player_type'] = f"自定义播放器 (class: {', '.join(matching_classes)})"
-        
-        # 检查ID
-        element_id = element.get('id', '')
-        if any(pattern.lower() in element_id.lower() for pattern in self.video_player_patterns['ids']):
-            result['is_player'] = True
-            result['player_type'] = f"自定义播放器 (id: {element_id})"
-            
-        # 检查data属性
-        data_attrs = {k: v for k, v in element.attrs.items() if k.startswith('data-')}
-        video_related_data = {k: v for k, v in data_attrs.items() if 'video' in k.lower()}
-        if video_related_data:
-            result['is_player'] = True
-            result['player_type'] = "数据属性视频播放器"
-            result['details']['data_attributes'] = video_related_data
+        # 检查类名和ID
+        if not result['is_player']:
+            result.update(self._check_video_attributes(element))
             
         return result
+
+    def _check_video_tag(self, element: Tag) -> Dict:
+        """检查视频相关标签"""
+        result = {
+            'is_player': True,
+            'player_type': self.video_player_patterns['tags'].get(element.name),
+            'source_type': None,
+            'details': {}
+        }
+        
+        src = element.get('src') or element.get('data-src', '')
+        if src:
+            result['details']['src'] = src
+            result['source_type'] = next(
+                (p for p in self.video_player_patterns['src_patterns'] 
+                 if re.search(p, src)), 'native'
+            )
+            
+        return result
+
+    def _check_video_attributes(self, element: Tag) -> Dict:
+        """检查视频相关属性"""
+        classes = set(element.get('class', []))
+        element_id = element.get('id', '').lower()
+        
+        video_classes = {c for c in classes 
+                        if any(p.lower() in c.lower() 
+                              for p in self.video_player_patterns['classes'])}
+                              
+        is_video = bool(video_classes) or any(
+            p.lower() in element_id 
+            for p in self.video_player_patterns['ids']
+        )
+        
+        return {
+            'is_player': is_video,
+            'player_type': '自定义播放器' if is_video else None,
+            'details': {'classes': list(video_classes)} if video_classes else {}
+        }
 
     def analyze_text_and_links(self, element: Tag) -> Dict:
         """分析元素内的文本和链接数量及内容"""
         texts = []
         links = []
         
-        for text in element.stripped_strings:
-            if not any(parent.name == 'a' for parent in element.parents):
-                texts.append(text)
+        # 检查元素是否可见
+        def is_visible(tag):
+            if not isinstance(tag, Tag):
+                return True
+            
+            style = tag.get('style', '').lower()
+            if 'display:none' in style or 'visibility:hidden' in style:
+                return False
+                
+            classes = tag.get('class', [])
+            if any('hide' in cls.lower() or 'hidden' in cls.lower() for cls in classes):
+                return False
+                
+            return True
         
-        for link in element.find_all('a'):
-            links.append({
-                'text': link.get_text(strip=True),
-                'href': link.get('href', ''),
-                'xpath': self.get_xpath(link)
-            })
+        # 只处理可见元素
+        if is_visible(element):
+            for text in element.stripped_strings:
+                if not any(parent.name == 'a' for parent in element.parents):
+                    texts.append(text)
+            
+            for link in element.find_all('a'):
+                if is_visible(link):
+                    links.append({
+                        'text': link.get_text(strip=True),
+                        'href': link.get('href', ''),
+                        'xpath': self.get_xpath_x(link)
+                    })
+        
             
         pure_text = ' '.join(texts)
         
-        text_links = [item['text'] for item in links]
-        text_links = ' '.join(text_links)
+        lnks_words_count = sum(len(d['text']) for d in links) 
+        word_counts_without_lnks = len(pure_text) - lnks_words_count  
         
         return {
             'text_content': pure_text,
             'text_length': len(pure_text),
             'link_count': len(links),
             'links': links,
-            'text_to_link_ratio': len(pure_text) / (len(text_links) if len(text_links)>0 else 1)
+            'text_to_link_ratio': len(pure_text) / (lnks_words_count if lnks_words_count>0 else 1),
+            'word_counts_without_lnks': word_counts_without_lnks
         }
+
+    def clean_html(self, html: str, clean_svg: bool = False, clean_base64: bool = False) -> str:
+        """清理HTML内容，移除不需要的标签和内容"""
+        flags = (re.IGNORECASE | re.MULTILINE | re.DOTALL)
+        
+        # 移除不需要的标签
+        for pattern_name in ['script', 'style', 'meta', 'comment', 'link']:
+            html = re.sub(self.PATTERNS[pattern_name], '', html, flags=flags)
+        
+        # 处理SVG
+        if clean_svg:
+            html = self._replace_svg(html)
+        
+        # 处理base64图片
+        if clean_base64:
+            html = self._replace_base64_images(html)
+        
+        return html
+    
+    def _replace_svg(self, html: str, new_content: str = "this is a placeholder") -> str:
+        """替换SVG内容为占位符"""
+        return re.sub(
+            self.PATTERNS['svg'],
+            lambda match: f"{match.group(1)}{new_content}{match.group(3)}",
+            html,
+            flags=re.DOTALL
+        )
+    
+    def _replace_base64_images(self, html: str, new_image_src: str = "#") -> str:
+        """替换base64编码的图片为普通图片链接"""
+        return re.sub(
+            self.PATTERNS['base64_img'], 
+            f'<img src="{new_image_src}"/>', 
+            html
+        )
+    
+    def has_base64_images(self, text: str) -> bool:
+        """检查文本是否包含base64编码的图片"""
+        return bool(re.search(
+            self.PATTERNS['base64_content'], 
+            text, 
+            flags=re.DOTALL
+        ))
+    
+    def has_svg_components(self, text: str) -> bool:
+        """检查文本是否包含SVG组件"""
+        return bool(re.search(
+            self.PATTERNS['svg'], 
+            text, 
+            flags=re.DOTALL
+        ))
 
     def analyze_structure(self, html_content: str) -> Dict:
         """分析HTML结构并返回带XPath的结果，包含文本、链接和视频播放器分析"""
+        html_content = self.clean_html(html_content)
         soup = BeautifulSoup(html_content, 'html.parser')
         body = soup.find('body')
         
@@ -221,19 +353,17 @@ class XPathHTMLAnalyzer:
     def _analyze_first_level(self, body: Tag) -> List[Dict]:
         """分析第一层元素，包含文本、链接和视频播放器分析"""
         first_level = []
-        
-        for element in body.children:
-            if not isinstance(element, Tag):
-                continue
                 
-            if element.name in ['script', 'style', 'link']:
+        for element in body.children:
+            if not self.is_visible(element):
                 continue
+            
             
             text_link_analysis = self.analyze_text_and_links(element)
             video_analysis = self.detect_video_player(element)
             
             element_info = {
-                "xpath": self.get_xpath(element),
+                "xpath": self.get_xpath_x(element),
                 "tag": element.name,
                 "classes": element.get('class', []),
                 "id": element.get('id', ''),
@@ -251,25 +381,21 @@ class XPathHTMLAnalyzer:
         """分析第二层元素，包含文本、链接和视频播放器分析"""
         second_level = []
         
+        
         for parent in body.children:
-            if not isinstance(parent, Tag):
-                continue
-                
-            if parent.name in ['script', 'style', 'link']:
+
+            if not self.is_visible(parent):
                 continue
                 
             for child in parent.children:
-                if not isinstance(child, Tag):
-                    continue
-                    
-                if child.name in ['script', 'style', 'link']:
+                if not self.is_visible(child):
                     continue
                 
                 text_link_analysis = self.analyze_text_and_links(child)
                 video_analysis = self.detect_video_player(child)
                 
                 child_info = {
-                    "xpath": self.get_xpath(child),
+                    "xpath": self.get_xpath_x(child),
                     "tag": child.name,
                     "classes": child.get('class', []),
                     "id": child.get('id', ''),
@@ -337,6 +463,7 @@ class XPathHTMLAnalyzer:
             "video_player_count": len(video_players)
         }
 
+
 async def print_analysis(data: str) :
     html_content = data['result_text']
     """打印分析结果，包含文本、链接和视频播放器分析"""
@@ -373,23 +500,14 @@ async def print_analysis(data: str) :
     ret = selector.xpath('/html/body')     # 返回为一列表
     tag_level1 = {'tags_xpath':set(), 'contents_xpath':set()}
     for i, elem in enumerate(results['first_level'], 1):
-        if elem['role'] in ['主要内容', '文章', '区块', '普通元素'] and elem['text_analysis']['text_length'] > 50:
-            if elem['text_analysis']['link_count'] > 0 and elem['text_analysis']['text_to_link_ratio'] >0.5 and elem['text_analysis']['text_to_link_ratio'] < 2.0:
+        if elem['role'] in ['主要内容', '文章', '区块', '普通元素'] and elem['text_analysis']['text_length'] > 0:
+            if elem['text_analysis']['link_count'] > 0 and  elem['text_analysis']['word_counts_without_lnks'] >=0 and elem['text_analysis']['word_counts_without_lnks'] < 10:
                 # 可能是列表元素
                 tag_level1['tags_xpath'].add(elem['xpath'])
             else: 
                 # 可能是正文元素
                 tag_level1['contents_xpath'].add(elem['xpath'])
                 
-        logger.debug(f"\n   元素 {i}:")
-        logger.debug(f"   - XPath: {elem['xpath']}")
-        logger.debug(f"   - 标签: {elem['tag']}")
-        logger.debug(f"   - 角色: {elem['role']}")
-        logger.debug(f"   - 文本长度: {elem['text_analysis']['text_length']} 字符")
-        logger.debug(f"   - 链接数量: {elem['text_analysis']['link_count']} 个")
-        logger.debug(f"   - 文本/链接比例: {elem['text_analysis']['text_to_link_ratio']:.2f}")
-        # element = html.xpath(elem['xpath'])
-
 
     logger.debug("\n3. 第二层元素:")
     for i, elem in enumerate(results['second_level'], 1):
@@ -406,12 +524,29 @@ async def print_analysis(data: str) :
                     
         for l1_path in tag_level1['contents_xpath']:
             if l1_path in elem['xpath']:
-                logger.debug(f"\n  内容 元素 {i}:")
-                if elem['text_analysis']['text_length'] > 20:
-                    final_report['contents'].add(elem['xpath'])
-                    logger.debug(f" {elem['text_analysis']['text_length']}")
-                    logger.debug(f"   - XPath: {elem['xpath']}")
-                
+                if elem['text_analysis']['word_counts_without_lnks'] > 10:
+                    logger.debug(f"\n ☆☆ 内容元素 ☆☆")
+                    
+                    # 使用XPath提取当前元素的所有文本节点，排除<a>标签内的文本
+                    try:
+                        # 获取当前元素
+                        element = selector.xpath(elem['xpath'])[0]
+                        
+                        # 获取所有直接文本节点和非链接元素的文本
+                        texts = []
+                        for text in element.xpath('.//text()[not(parent::a)]'):
+                            text = text.strip()
+                            if text:  # 只保留非空文本
+                                texts.append(text)
+                        
+                        pure_text = ' '.join(texts)
+                        logger.debug(f"   - XPath: {elem['xpath']}")
+                        logger.debug(f"   - 文本内容: {pure_text}")
+                        final_report['contents'].add(pure_text)
+                    except Exception as e:
+                        logger.error(f"XPath提取失败: {e}")
+                        final_report['contents'].add(f"XPath提取失败: {e}")
+                        continue
     logger.debug("\n=== L结构分析报告 (结论)===\n")
     return {
         'id': data['id'],
@@ -444,7 +579,7 @@ async def main(concurrency):
             await cursor.execute('select id, result_text from spider_test.details_test_table dtt')
             mysql_data = await cursor.fetchall()
     except Exception as e:
-        logging.error(f"Failed to connect to MySQL: {e}")
+        logger.error(f"Failed to connect to MySQL: {e}")
         return
     finally:
         conn.close()
